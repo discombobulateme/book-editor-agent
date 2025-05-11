@@ -1,0 +1,613 @@
+import os
+import anthropic
+from dotenv import load_dotenv
+import glob
+import time
+import re
+import argparse
+import traceback
+
+# Import our terminal colors utility
+from terminal_colors import Colors, print_header, print_subheader, print_stats, success, warning, error, info, debug
+
+# Load environment variables
+load_dotenv()
+
+def get_api_key():
+    """Get the Anthropic API key from environment variables"""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("No API key found. Please set the ANTHROPIC_API_KEY environment variable.")
+    return api_key
+
+def create_anthropic_client(api_key):
+    """Create and return an Anthropic client"""
+    # Simple initialization without proxy settings for compatibility with version 0.6.0
+    return anthropic.Anthropic(api_key=api_key)
+
+def get_text_files():
+    """Get a list of text files from the original-texts directory"""
+    return glob.glob("original-texts/*.txt")
+
+def get_review_notes(filename):
+    """Get review notes for a text file if they exist"""
+    base_name = os.path.basename(filename)
+    review_file = os.path.join("review-notes", base_name)
+    
+    if os.path.exists(review_file):
+        with open(review_file, "r") as f:
+            return f.read()
+    return None
+
+def read_file_content(filename):
+    """Read the content of a file"""
+    with open(filename, "r") as f:
+        return f.read()
+
+def save_edited_text(filename, edited_content, model_name):
+    """Save the edited text to the edited-texts directory with model name in filename"""
+    # Extract just the filename from the path
+    base_name = os.path.basename(filename)
+    
+    # Create the directory if it doesn't exist
+    os.makedirs("edited-texts", exist_ok=True)
+    
+    # Split the base name into name and extension
+    name, ext = os.path.splitext(base_name)
+    
+    # Get a shortened model identifier
+    model_id = model_name
+    
+    # Create output path
+    output_path = os.path.join("edited-texts", f"{name}-{model_id}{ext}")
+    
+    # Check if the file already exists and add a version number if it does
+    version = 1
+    while os.path.exists(output_path):
+        # Increment version number and create a new filename
+        output_path = os.path.join("edited-texts", f"{name}-{model_id}-{version}{ext}")
+        version += 1
+    
+    # Write the edited content to the file
+    with open(output_path, "w") as f:
+        f.write(edited_content)
+    
+    info(f"Saved edited text to {output_path}")
+    return output_path
+
+def create_editing_prompt(original_text, review_notes, instructions_content):
+    """Create a prompt for the AI to edit the text"""
+    prompt = (
+        "You are a professional editor skilled in enhancing text without losing content or nuance.\n\n"
+        
+        "## EDITING INSTRUCTIONS\n\n"
+        "1. Edit the following text according to the style guidelines provided below.\n"
+        "2. Preserve all important information, facts, and details from the original text.\n"
+        "3. Maintain the original text organization and paragraph structure.\n"
+        "4. If the review notes request shortening, make the text more concise.\n"
+        "5. Otherwise, maintain the full content and approximately the same length.\n"
+        "6. Follow the Structured Experiential Theory approach as defined in the style guide.\n"
+        "7. Return ONLY the edited text without any explanations or comments.\n\n"
+        
+        "## STYLE GUIDELINES\n"
+        f"{instructions_content}\n\n"
+        
+        "## ORIGINAL TEXT\n"
+        f"{original_text}\n\n"
+    )
+    
+    if review_notes:
+        prompt += (
+            "## REVIEW NOTES\n"
+            f"{review_notes}\n\n"
+        )
+    
+    prompt += "## YOUR EDITED TEXT\n"
+    
+    return prompt
+
+def is_already_edited(filename, model):
+    """Check if a file has already been edited by this model and has no review notes to incorporate"""
+    base_name = os.path.basename(filename)
+    name, ext = os.path.splitext(base_name)
+    
+    # Check if an edited version exists
+    edited_glob = os.path.join("edited-texts", f"{name}-{model}*{ext}")
+    edited_files = glob.glob(edited_glob)
+    
+    # If no edited version exists, the file needs editing
+    if not edited_files:
+        return False
+    
+    # If review notes exist, the file should be re-edited
+    review_notes = get_review_notes(filename)
+    if review_notes:
+        return False
+    
+    # File has been edited and no review notes exist
+    return True
+
+def edit_text_with_claude(client, text_file, model, instructions_content):
+    """Edit a text file using Claude"""
+    # Check if the file has already been edited by this model and has no review notes
+    if is_already_edited(text_file, model):
+        info(f"Skipping {text_file} - already edited by {model} and no review notes found.")
+        return None
+    
+    print_header(f"PROCESSING: {text_file} with model {model}")
+    
+    # Read the text file
+    original_text = read_file_content(text_file)
+    
+    # Get review notes if they exist
+    review_notes = get_review_notes(text_file)
+    
+    if review_notes:
+        print_subheader("📝 REVIEW NOTES FOUND")
+        info(review_notes)
+    else:
+        info("📋 No review notes found. Proceeding with standard editing.")
+    
+    # Get text statistics for original text
+    original_word_count = len(original_text.split())
+    original_char_count = len(original_text)
+    original_paragraphs = len([p for p in original_text.split('\n\n') if p.strip()])
+    
+    print_subheader("📊 ORIGINAL TEXT STATISTICS")
+    print_stats("Words", original_word_count)
+    print_stats("Characters", original_char_count)
+    print_stats("Paragraphs", original_paragraphs)
+    
+    # Create prompt
+    prompt = create_editing_prompt(original_text, review_notes, instructions_content)
+    
+    # Set max_tokens based on model
+    max_tokens = get_max_tokens_for_model(model)
+
+    # Send to Claude
+    try:
+        info("🚀 Sending request to Claude API")
+        info("⏳ This may take some time depending on the length of your text...")
+        
+        start_time = time.time()
+        message = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.85,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        end_time = time.time()
+        
+        duration = end_time - start_time
+        success(f"Request completed in {duration:.1f} seconds")
+        
+        # Extract the edited text
+        edited_text = message.content[0].text
+        
+        # Clean up the response to remove any metadata
+        info("🧹 Cleaning up any metadata or formatting...")
+        edited_text = cleanup_response(edited_text)
+        
+        # Get word count stats for edited text
+        edited_word_count = len(edited_text.split())
+        edited_char_count = len(edited_text)
+        edited_paragraphs = len([p for p in edited_text.split('\n\n') if p.strip()])
+        
+        print_subheader("📊 EDITED TEXT STATISTICS")
+        print_stats("Words", edited_word_count, original_word_count)
+        print_stats("Characters", edited_char_count, original_char_count)
+        print_stats("Paragraphs", edited_paragraphs, original_paragraphs)
+        
+        # Validate the edited text
+        if not validate_edited_text(original_text, edited_text, review_notes):
+            warning("Attempting to regenerate edited text...")
+            
+            # Add stronger instructions to prevent shortening
+            retrying_prompt = (
+                "You are a professional editor skilled in enhancing text without losing content or nuance.\n\n"
+                
+                "## IMPORTANT CORRECTION NEEDED\n\n"
+                "Your previous edit was too short or appeared to be a summary. Please try again with these requirements:\n"
+                "- Do NOT summarize or condense the text unless specifically asked to in the review notes\n"
+                "- Maintain the FULL length and content of the original text\n"
+                "- Preserve the same number of paragraphs as the original\n"
+                "- Apply the style guidelines while keeping all original details\n\n"
+                
+                "## STYLE GUIDELINES\n"
+                f"{instructions_content}\n\n"
+                
+                "## ORIGINAL TEXT\n"
+                f"{original_text}\n\n"
+            )
+            
+            if review_notes:
+                retrying_prompt += (
+                    "## REVIEW NOTES\n"
+                    f"{review_notes}\n\n"
+                )
+            
+            retrying_prompt += "## YOUR CORRECTED EDIT (FULL LENGTH)\n"
+            
+            # Try again with stronger instructions
+            info("🔄 Sending request with stronger instructions...")
+            
+            start_time = time.time()
+            message = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=0.85,
+                messages=[
+                    {"role": "user", "content": retrying_prompt}
+                ]
+            )
+            end_time = time.time()
+            
+            duration = end_time - start_time
+            success(f"Request completed in {duration:.1f} seconds")
+            
+            # Extract the edited text from retry
+            edited_text = message.content[0].text
+            
+            # Clean up the response again
+            edited_text = cleanup_response(edited_text)
+            
+            # Final validation
+            if not validate_edited_text(original_text, edited_text, review_notes):
+                warning("AI still produced shortened text. Saving anyway, but please review.")
+        
+        # Save the edited text
+        output_path = save_edited_text(text_file, edited_text, model)
+        
+        # Print final statistics
+        final_word_count = len(edited_text.split())
+        final_char_count = len(edited_text)
+        final_paragraphs = len([p for p in edited_text.split('\n\n') if p.strip()])
+        
+        final_word_ratio = final_word_count / original_word_count * 100
+        
+        print_subheader("📊 FINAL STATISTICS")
+        info(f"Original: {original_word_count} words, {original_paragraphs} paragraphs")
+        info(f"Edited:   {final_word_count} words, {final_paragraphs} paragraphs")
+        info(f"Ratio:    {final_word_ratio:.1f}% of original length")
+        
+        success(f"Saved edited text to: {output_path}")
+        info(f"{'='*80}\n")
+        
+        return edited_text
+    except Exception as e:
+        error(f"Error processing {text_file}: {e}")
+        traceback.print_exc()
+        return None
+
+def get_max_tokens_for_model(model):
+    """Get appropriate max_tokens value based on model"""
+    if "haiku" in model:
+        return 4000
+    elif "sonnet" in model:
+        return 8000
+    elif "opus" in model:
+        return 12000
+    else:
+        return 4000  # Default to a conservative value
+
+def get_available_models():
+    """Return a dictionary of available Claude models with their descriptions"""
+    return {
+        "claude-3-5-sonnet-20240620": "Balanced performance and cost",
+        "claude-3-opus-20240229": "Highest quality, most expensive",
+        "claude-3-sonnet-20240229": "Good balance of quality and cost",
+        "claude-3-haiku-20240307": "Fastest and most affordable",
+        "claude-3-5-haiku-20240620": "Latest affordable model with good performance",
+        "claude-3-5-sonnet-20240620": "Latest balanced model"
+    }
+
+def sanitize_custom_id(filename):
+    """Create a valid custom_id from a filename (alphanumeric, underscore, hyphen, max 64 chars)"""
+    # Extract the base name without extension
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    # Replace invalid characters with underscores
+    sanitized = re.sub(r'[^a-zA-Z0-9_-]', '_', base_name)
+    # Truncate to 64 characters if longer
+    if len(sanitized) > 64:
+        sanitized = sanitized[:64]
+    return sanitized
+
+def process_batch_item(client, text_file, model, instructions_content):
+    """Process a single item from a batch, with validation and cleanup"""
+    # Read the text file
+    original_text = read_file_content(text_file)
+    
+    # Get review notes if they exist
+    review_notes = get_review_notes(text_file)
+    
+    if review_notes:
+        info(f"📝 Review notes found")
+    
+    # Create prompt
+    prompt = create_editing_prompt(original_text, review_notes, instructions_content)
+    
+    # Set max_tokens based on model
+    max_tokens = get_max_tokens_for_model(model)
+
+    # Send to Claude
+    try:
+        info(f"🚀 Sending request to Claude API")
+        start_time = time.time()
+        
+        message = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.85,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        duration = time.time() - start_time
+        success(f"Request completed in {duration:.1f} seconds")
+        
+        # Extract the edited text
+        edited_text = message.content[0].text
+        
+        # Clean up the response to remove any metadata
+        edited_text = cleanup_response(edited_text)
+        
+        # Validate the edited text
+        if not validate_edited_text(original_text, edited_text, review_notes):
+            warning(f"Batch item {text_file} produced shortened text - regenerating...")
+            
+            # Add stronger instructions to prevent shortening
+            retrying_prompt = (
+                "You are a professional editor skilled in enhancing text without losing content or nuance.\n\n"
+                
+                "## IMPORTANT CORRECTION NEEDED\n\n"
+                "Your previous edit was too short or appeared to be a summary. Please try again with these requirements:\n"
+                "- Do NOT summarize or condense the text unless specifically asked to in the review notes\n"
+                "- Maintain the FULL length and content of the original text\n"
+                "- Preserve the same number of paragraphs as the original\n"
+                "- Apply the style guidelines while keeping all original details\n\n"
+                
+                "## STYLE GUIDELINES\n"
+                f"{instructions_content}\n\n"
+                
+                "## ORIGINAL TEXT\n"
+                f"{original_text}\n\n"
+            )
+            
+            if review_notes:
+                retrying_prompt += (
+                    "## REVIEW NOTES\n"
+                    f"{review_notes}\n\n"
+                )
+            
+            retrying_prompt += "## YOUR CORRECTED EDIT (FULL LENGTH)\n"
+            
+            # Try again with stronger instructions
+            info("🔄 Sending request with stronger instructions...")
+            start_time = time.time()
+            
+            message = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=0.85,
+                messages=[
+                    {"role": "user", "content": retrying_prompt}
+                ]
+            )
+            
+            duration = time.time() - start_time
+            success(f"Request completed in {duration:.1f} seconds")
+            
+            # Extract the edited text from retry
+            edited_text = message.content[0].text
+            
+            # Clean up the response again
+            edited_text = cleanup_response(edited_text)
+            
+            # Final validation
+            if not validate_edited_text(original_text, edited_text, review_notes):
+                warning(f"Batch item {text_file} still produced shortened text. Saving anyway.")
+        
+        # Save the edited text
+        output_path = save_edited_text(text_file, edited_text, model)
+        success(f"Saved edited text to {output_path}")
+        
+        return edited_text
+    except Exception as e:
+        error(f"Error processing batch item {text_file}: {e}")
+        return None
+
+def batch_edit_texts(client, text_files, model, instructions_content):
+    """Process multiple text files in a batch request"""
+    if not text_files:
+        warning("No text files found in original-texts directory.")
+        return
+    
+    # Filter files that need editing
+    files_to_edit = []
+    for text_file in text_files:
+        if is_already_edited(text_file, model):
+            info(f"Skipping {text_file} - already edited by {model} and no review notes found.")
+        else:
+            files_to_edit.append(text_file)
+    
+    if not files_to_edit:
+        info("No files need editing.")
+        return
+    
+    # Process files individually
+    success(f"Processing {len(files_to_edit)} files...")
+    
+    for i, text_file in enumerate(files_to_edit):
+        print_subheader(f"BATCH ITEM {i+1}/{len(files_to_edit)}: {text_file}")
+        process_batch_item(client, text_file, model, instructions_content)
+        
+    success("Batch processing complete!")
+
+def validate_edited_text(original_text, edited_text, review_notes=None):
+    """Validate that the edited text is not significantly shorter than the original
+    unless specifically requested in review notes.
+    Returns True if the text is valid, False if it needs to be redone"""
+    
+    # Calculate basic statistics
+    original_words = len(original_text.split())
+    edited_words = len(edited_text.split())
+    word_ratio = edited_words / original_words
+    
+    # Count paragraphs
+    original_paragraphs = len([p for p in original_text.split('\n\n') if p.strip()])
+    edited_paragraphs = len([p for p in edited_text.split('\n\n') if p.strip()])
+    
+    # Print statistics
+    info(f"Original text: {original_words} words, {original_paragraphs} paragraphs")
+    info(f"Edited text: {edited_words} words, {edited_paragraphs} paragraphs")
+    info(f"Word ratio: {word_ratio*100:.1f}%")
+    
+    # Check for summary indicators
+    summary_phrases = [
+        "the text below", "this text", "this is a", "below is a", 
+        "condensed version", "shorter version", "summary of"
+    ]
+    
+    # Check if the edited text starts with a summary indicator
+    first_100_words = " ".join(edited_text.split()[:100]).lower()
+    has_summary_indicator = any(phrase in first_100_words for phrase in summary_phrases)
+    
+    # If review notes exist, we allow some shortening
+    if review_notes:
+        # Only flag as invalid if very heavily shortened (less than 50%)
+        if word_ratio < 0.5:
+            warning(f"Edited text is excessively shortened: {word_ratio*100:.1f}% of original length")
+            return False
+        
+        # Accept the edit if it has a reasonable length
+        success(f"Edited text length acceptable: {word_ratio*100:.1f}% of original")
+        return True
+    
+    # If no review notes exist (no shortening should happen):
+    
+    # Check if too short (less than 90% of original)
+    if word_ratio < 0.9:
+        warning(f"Edited text is too short ({word_ratio*100:.1f}% of original)")
+        return False
+    
+    # Check for significant paragraph structure changes
+    if edited_paragraphs < original_paragraphs * 0.9 and original_paragraphs > 3:
+        warning(f"Edited text has fewer paragraphs ({edited_paragraphs} vs {original_paragraphs})")
+        return False
+    
+    # Check for summary indicators when no shortening was requested
+    if has_summary_indicator:
+        warning(f"Edited text appears to be a summary rather than an edit")
+        return False
+        
+    success(f"Validation successful: {edited_words} words ({word_ratio*100:.1f}% of original)")
+    return True
+
+def cleanup_response(text):
+    """Clean up the response from the model by removing any metadata or notes at the end"""
+    
+    # Common endings that models might add
+    ending_phrases = [
+        "This text has been edited",
+        "I have edited the text",
+        "The edited text follows",
+        "Here is the edited text",
+        "I've maintained the full length",
+        "I've preserved all content",
+        "This edit maintains",
+        "Edited according to",
+        "Following the style guidelines",
+        "As per the instructions",
+    ]
+    
+    # Check for any of the ending phrases and remove them and anything that follows
+    cleaned_text = text
+    for phrase in ending_phrases:
+        if phrase in cleaned_text:
+            # Split on the phrase and take only what comes before it
+            cleaned_text = cleaned_text.split(phrase)[0].strip()
+    
+    # Also remove anything after common markdown or comment delimiters if they appear near the end
+    ending_delimiters = ["---", "***", "###", "```", "//"]
+    for delimiter in ending_delimiters:
+        # Only consider delimiters in the last 15% of the text to avoid removing content
+        search_start = int(len(cleaned_text) * 0.85)
+        last_part = cleaned_text[search_start:]
+        if delimiter in last_part:
+            # Find the position in the full text
+            delimiter_pos = cleaned_text.rfind(delimiter, search_start)
+            # Check if there's text after this delimiter that looks like metadata
+            text_after = cleaned_text[delimiter_pos:].lower()
+            if any(phrase.lower() in text_after for phrase in ["edit", "note", "comment", "text", "follow"]):
+                cleaned_text = cleaned_text[:delimiter_pos].strip()
+    
+    return cleaned_text
+
+def main():
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description="Book Editor Agent using Claude AI")
+    parser.add_argument("--model", "-m", 
+                        default="claude-3-haiku-20240307",
+                        help="Claude model to use for editing")
+    parser.add_argument("--list-models", "-l", action="store_true",
+                        help="List available Claude models with descriptions")
+    parser.add_argument("--batch", "-b", action="store_true",
+                        help="Process files in batch mode")
+    
+    args = parser.parse_args()
+    
+    # List models if requested
+    if args.list_models:
+        models = get_available_models()
+        info("Available Claude models:")
+        for model, description in models.items():
+            info(f"  {model}: {description}")
+        return
+    
+    # Get API key and create client
+    try:
+        api_key = get_api_key()
+        client = create_anthropic_client(api_key)
+        success("Connected to Anthropic API")
+    except ValueError as e:
+        error(str(e))
+        info("Make sure you have set the ANTHROPIC_API_KEY environment variable.")
+        return
+    except Exception as e:
+        error(f"Failed to initialize Anthropic client: {str(e)}")
+        return
+    
+    # Get text files
+    text_files = get_text_files()
+    
+    if not text_files:
+        warning("No text files found in original-texts directory.")
+        return
+    
+    info(f"Found {len(text_files)} text files to process")
+    
+    # Read instructions for style guidelines
+    try:
+        instructions_content = read_file_content("INSTRUCTIONS.md")
+        success("Successfully loaded style guidelines from INSTRUCTIONS.md")
+    except FileNotFoundError:
+        warning("INSTRUCTIONS.md not found. Using default style guidelines.")
+        instructions_content = "Default style guidelines: Academic yet accessible writing with clear explanations."
+    
+    # Process files
+    if args.batch:
+        # Process files in batch
+        print_header(f"BATCH PROCESSING {len(text_files)} FILES WITH {args.model}")
+        batch_edit_texts(client, text_files, args.model, instructions_content)
+    else:
+        # Process files individually
+        for text_file in text_files:
+            edit_text_with_claude(client, text_file, args.model, instructions_content)
+            
+    success("Book editing process complete!")
+
+if __name__ == "__main__":
+    main() 
