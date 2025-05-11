@@ -94,6 +94,9 @@ python3 open_editor_agent.py file.txt --model llama3.1 --instructions custom_sty
 
 # Process with review notes
 python3 open_editor_agent.py file.txt --review path/to/review-notes.txt
+
+# Process all files in original-texts directory with batch mode
+python3 open_editor_agent.py --batch --model llama3.1
 ```
 
 Example with review notes:

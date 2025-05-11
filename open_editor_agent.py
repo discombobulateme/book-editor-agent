@@ -471,11 +471,12 @@ def edit_by_paragraph(original_text, instructions_content, model_name, ollama_ba
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Edit text file based on style guidelines using Ollama API")
-    parser.add_argument("files", nargs="+", help="Path to text file(s) to edit")
+    parser.add_argument("files", nargs="*", help="Path to text file(s) to edit (optional if using --batch)")
     parser.add_argument("--model", default="mistral", help="Model name to use (default: mistral)")
     parser.add_argument("--instructions", default="INSTRUCTIONS.md", help="Path to style instructions file (default: INSTRUCTIONS.md)")
     parser.add_argument("--ollama-url", default=None, help="Ollama API base URL (default: http://localhost:11434)")
     parser.add_argument("--review", help="Path to review notes file")
+    parser.add_argument("--batch", "-b", action="store_true", help="Process all files in original-texts directory")
     args = parser.parse_args()
     
     # Read the style instructions
@@ -501,12 +502,35 @@ def main():
             info(f"\n❌ Error reading review notes: {str(e)}")
             info("Processing will continue without review notes.")
     
+    # Determine which files to process
+    files_to_process = []
+    if args.batch:
+        # Process all files in original-texts directory
+        files_to_process = get_text_files()
+        if not files_to_process:
+            info("\n❌ No text files found in original-texts directory.")
+            return
+        info(f"\n✅ Batch mode: Found {len(files_to_process)} text files to process")
+    elif args.files:
+        # Process specific files provided as arguments
+        files_to_process = args.files
+    else:
+        # No files specified and no batch mode
+        info("\n❌ Error: No files specified. Please provide files or use --batch option.")
+        parser.print_help()
+        return
+    
     # Process files individually
-    for text_file in args.files:
+    for text_file in files_to_process:
         info(f"\n{Colors.SEPARATOR}{'='*80}")
         info(f"{Colors.HEADER}🔄 PROCESSING: {text_file} with model {args.model}")
         info(f"{Colors.SEPARATOR}{'='*80}")
         info("")
+        
+        # Skip if already edited (for batch mode)
+        if args.batch and is_already_edited(text_file, args.model):
+            info(f"⏭️  Skipping {text_file} - already edited by {args.model} and no review notes found.")
+            continue
         
         output_file = create_output_path(text_file)
         result = edit_text(
