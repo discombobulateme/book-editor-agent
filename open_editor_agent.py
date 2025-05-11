@@ -299,7 +299,7 @@ def create_output_path(input_file):
     
     return output_file
 
-def edit_text(input_file, output_path=None, model_name="mistral", review_notes=None, instructions_file='style_instructions.md', ollama_base_url=None):
+def edit_text(input_file, output_path=None, model_name="mistral", review_notes=None, instructions_file='INSTRUCTIONS.md', ollama_base_url=None):
     """Edit the text in the input file and save the result to the output file"""
     try:
         # Read the input file
@@ -473,7 +473,7 @@ def main():
     parser = argparse.ArgumentParser(description="Edit text file based on style guidelines using Ollama API")
     parser.add_argument("files", nargs="+", help="Path to text file(s) to edit")
     parser.add_argument("--model", default="mistral", help="Model name to use (default: mistral)")
-    parser.add_argument("--instructions", default="style_instructions.md", help="Path to style instructions file (default: style_instructions.md)")
+    parser.add_argument("--instructions", default="INSTRUCTIONS.md", help="Path to style instructions file (default: INSTRUCTIONS.md)")
     parser.add_argument("--ollama-url", default=None, help="Ollama API base URL (default: http://localhost:11434)")
     parser.add_argument("--review", help="Path to review notes file")
     args = parser.parse_args()

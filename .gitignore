@@ -2,10 +2,11 @@
 venv/
 __pycache__/
 *.pyc
-*.txt
-*.md
 *.json
 *.jsonl
 
 .DS_Store
 *.DS_Store
+
+original-texts/
+edited-texts/
