@@ -16,7 +16,7 @@ import signal
 import sys
 
 # Import our terminal colors utility
-from terminal_colors import Colors, print_header, print_subheader, print_stats, success, warning, error, info, debug
+from terminal_colors import Colors, print_header, print_subheader, print_stats, success, warning, error, info, debug, Spinner
 
 # Load environment variables
 load_dotenv()
@@ -212,36 +212,40 @@ def call_ollama_api(model_name, prompt, base_url=None, temp_adjustment=0):
         "stream": False
     }
     
-    start_time = time.time()
-    info(f"⏳ Sending request to Ollama API...")
+    spinner = Spinner(f"Sending request to {model_name}... waiting for response").start()
     
     try:
         response = requests.post(api_url, json=payload)
         response.raise_for_status()  # Raise exception for HTTP errors
         
-        completion_time = time.time() - start_time
-        success(f"Response received in {completion_time:.1f} seconds")
-        
         result = response.json()
         
         # Handle error responses from Ollama
         if 'error' in result:
+            spinner.stop()
             error_msg = result.get('error', 'Unknown error')
             error(f"Ollama API error: {error_msg}")
             if "no models found" in error_msg.lower():
                 info(f"💡 Tip: You might need to download the model first with 'ollama pull {model_name}'")
             raise Exception(f"Ollama API error: {error_msg}")
-            
+        
+        spinner.stop(f"Response received from {model_name}")
         return result.get('response', '')
         
     except requests.exceptions.ConnectionError:
+        spinner.stop()
         error(f"Connection error: Could not connect to Ollama at {base_url}")
         info(f"💡 Tip: Make sure Ollama is running with 'ollama serve'")
         raise Exception("Connection error: Could not connect to Ollama server")
         
     except requests.exceptions.RequestException as e:
+        spinner.stop()
         error(f"Request error: {str(e)}")
         raise Exception(f"Request error: {str(e)}")
+    except Exception as e:
+        spinner.stop()
+        error(f"Unexpected error: {str(e)}")
+        raise
 
 def is_already_edited(filename, model):
     """Check if a file has already been edited by this model and has no review notes to incorporate"""
@@ -330,16 +334,19 @@ def create_output_path(input_file, model_name="model"):
 
 def edit_text(input_file, output_path=None, model_name="mistral", review_notes=None, instructions_file='INSTRUCTIONS.md', ollama_base_url=None):
     """Edit the text in the input file and save the result to the output file"""
+    spinner = None
     try:
         # Read the input file
-        info(f"📄 Reading input file: {input_file}")
+        spinner = Spinner("Reading input file...").start()
         with open(input_file, 'r', encoding='utf-8') as f:
             original_text = f.read()
+        spinner.stop(f"Read input file: {input_file}")
         
         # Read the style instructions
-        info(f"📝 Reading style instructions from: {instructions_file}")
+        spinner = Spinner("Reading style instructions...").start()
         with open(instructions_file, 'r', encoding='utf-8') as f:
             instructions_content = f.read()
+        spinner.stop(f"Read style instructions from: {instructions_file}")
             
         # Create output path if not provided
         if not output_path:
@@ -347,6 +354,8 @@ def edit_text(input_file, output_path=None, model_name="mistral", review_notes=N
             
         # Handle cleanup on Ctrl+C
         def signal_handler(sig, frame):
+            if spinner:
+                spinner.stop()
             info(f"\n🛑 Editing process interrupted. Cleaning up...")
             if os.path.exists(output_path):
                 info(f"Removing partial output file: {output_path}")
@@ -356,24 +365,31 @@ def edit_text(input_file, output_path=None, model_name="mistral", review_notes=N
         signal.signal(signal.SIGINT, signal_handler)
         
         # Create prompt
-        info(f"🔍 Preparing editing prompt...")
+        spinner = Spinner("Preparing editing prompt...").start()
         prompt = create_editing_prompt(original_text, review_notes, instructions_content, model_name)
+        spinner.stop("Editing prompt prepared")
         
         # Call the AI model
-        info(f"🤖 Calling {model_name} to edit the text...")
+        spinner = Spinner(f"Calling {model_name} to edit text... This may take a while").start()
         edited_text = call_ollama_api(model_name, prompt, ollama_base_url)
+        process_time = spinner.stop(f"Editing with {model_name} completed")
         
         # Check if we've lost too much content
+        spinner = Spinner("Validating edited text...").start()
         is_valid, message = validate_edited_text(original_text, edited_text, review_notes is not None, model_name)
+        spinner.stop("Validation completed")
         
         # If validation failed and review notes don't exist (so we shouldn't be shortening),
         # try the paragraph approach
         if not is_valid and not review_notes:
             warning(f"⚠️ {message}")
             info(f"🧩 Trying paragraph-by-paragraph approach...")
+            spinner = Spinner("Editing by paragraph... This may take longer").start()
             edited_text = edit_by_paragraph(original_text, instructions_content, model_name, ollama_base_url)
+            spinner.stop("Paragraph editing completed")
         
         # Write the result to the output file
+        spinner = Spinner("Saving edited text...").start()
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(edited_text)
             
@@ -381,13 +397,15 @@ def edit_text(input_file, output_path=None, model_name="mistral", review_notes=N
         original_wc = len(original_text.split())
         edited_wc = len(edited_text.split())
         diff_pct = ((edited_wc - original_wc) / original_wc) * 100 if original_wc > 0 else 0
+        spinner.stop(f"Edited text saved to: {output_path}")
             
-        info(f"✅ Edited text saved to: {output_path}")
         info(f"📊 Word count: {original_wc} → {edited_wc} ({diff_pct:+.1f}%)")
         
         return output_path
         
     except Exception as e:
+        if spinner:
+            spinner.stop()
         error(f"\n❌ Error editing text: {str(e)}")
         traceback.print_exc()
         return None
@@ -471,7 +489,9 @@ def edit_by_paragraph(original_text, instructions_content, model_name, ollama_ba
     for i, paragraph in enumerate(paragraphs):
         # Progress indicator
         progress = f"[{i+1}/{len(paragraphs)}]"
-        info(f"{progress} Editing paragraph {i+1}...")
+        
+        # Create spinner with progress information
+        spinner = Spinner(f"Editing paragraph {i+1}/{len(paragraphs)}...").start()
         
         # Create a simplified prompt for this paragraph
         paragraph_prompt = (
@@ -487,7 +507,7 @@ def edit_by_paragraph(original_text, instructions_content, model_name, ollama_ba
         
         # Show minimal progress feedback
         word_diff = len(edited_paragraph.split()) - len(paragraph.split())
-        info(f"{progress} Complete: {word_diff:+} words change")
+        spinner.stop(f"Paragraph {i+1}/{len(paragraphs)} completed ({word_diff:+} words)")
     
     # Join all paragraphs with double newlines
     edited_text = "\n\n".join(edited_paragraphs)
