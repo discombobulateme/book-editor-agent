@@ -28,8 +28,20 @@ def create_anthropic_client(api_key):
     # Simple initialization without proxy settings for compatibility with version 0.6.0
     return anthropic.Anthropic(api_key=api_key)
 
-def get_text_files():
-    """Get a list of text files (.txt and .docx) from the original-texts directory"""
+def get_text_files(specific_file=None):
+    """Get a list of text files (.txt and .docx) from the original-texts directory or a specific file"""
+    if specific_file:
+        # If a specific file was provided, check if it exists
+        if os.path.exists(specific_file):
+            return [specific_file]
+        # If the specific file doesn't exist, try looking for it in the original-texts directory
+        possible_path = os.path.join("original-texts", os.path.basename(specific_file))
+        if os.path.exists(possible_path):
+            return [possible_path]
+        # If still not found, return an empty list
+        return []
+    
+    # Otherwise get all text files in the original-texts directory
     return glob.glob("original-texts/*.txt") + glob.glob("original-texts/*.docx")
 
 def get_review_notes(filename):
@@ -282,22 +294,40 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
         signal.alarm(timeout_seconds)
         
         try:
-            start_time = time.time()
-            message = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=0.85,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            
-            # Cancel the alarm and restore the old handler
-            signal.alarm(0)
-            
-            end_time = time.time()
-            duration = end_time - start_time
-            api_spinner.stop(f"Request completed in {duration:.1f} seconds")
+            try:
+                start_time = time.time()
+                message = client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=0.85,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                
+                # Immediately stop monitoring on successful completion
+                end_time = time.time()
+                duration = end_time - start_time
+                
+                # First handle alarms
+                signal.alarm(0)  # Cancel any pending alarms immediately
+                
+                # First stop the connection monitoring - do this BEFORE updating UI
+                if connection_monitor:
+                    connection_monitor.request_completed = True  # Mark request as completed
+                    connection_monitor.stop_monitoring()
+                
+                # Then stop the spinner with completion message
+                if api_spinner:
+                    api_spinner.request_in_progress = False  # Mark request as completed
+                    api_spinner.stop(f"Request completed in {duration:.1f} seconds")
+            except Exception as e:
+                # Clean up resources on error
+                if connection_monitor:
+                    connection_monitor.stop_monitoring()
+                if api_spinner:
+                    api_spinner.stop(f"Request failed: {str(e)}")
+                raise  # Re-raise the exception
             
             # Extract the edited text
             edited_text = message.content[0].text
@@ -368,50 +398,57 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
                     )
                 
                 retrying_prompt += "## YOUR CORRECTED EDIT (FULL LENGTH)\n"
+                spinner.stop("Retry prompt ready")
                 
-                # Estimate token count for retry
-                retry_input_tokens = len(retrying_prompt.split()) * 1.3  # Rough estimate
-                spinner.stop(f"Retry prompt prepared (~{int(retry_input_tokens)} estimated tokens)")
-                
-                # Create a new connection monitor for the retry
-                retry_connection_monitor = AnthropicConnectionMonitor(client, timeout=300)
+                # Create a connection monitor for the retry
+                retry_connection_monitor = AnthropicConnectionMonitor(client, timeout=180)
                 
                 # Try again with real status monitoring
                 retry_api_spinner = ConnectionMonitoringSpinner(
                     message="Sending retry request to Claude API...",
                     check_interval=3,
-                    timeout=360
+                    timeout=240
                 ).start_request()
                 
                 # Start monitoring the retry connection
-                retry_connection_monitor.start_request(retry_api_spinner, estimated_tokens=retry_input_tokens, model=model)
+                retry_estimated_tokens = len(retrying_prompt.split()) * 1.3  # Rough estimate
+                retry_connection_monitor.start_request(retry_api_spinner, estimated_tokens=retry_estimated_tokens, model=model)
                 
-                start_time = time.time()
-                message = client.messages.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=0.85,
-                    messages=[
-                        {"role": "user", "content": retrying_prompt}
-                    ]
-                )
+                try:
+                    start_time = time.time()
+                    message = client.messages.create(
+                        model=model,
+                        max_tokens=max_tokens,
+                        temperature=0.85,
+                        messages=[
+                            {"role": "user", "content": retrying_prompt}
+                        ]
+                    )
+                    
+                    # Calculate time taken
+                    duration = time.time() - start_time
+                    
+                    # Stop the connection monitor
+                    if retry_connection_monitor:
+                        retry_connection_monitor.stop_monitoring()
+                    
+                    # Stop the spinner
+                    if retry_api_spinner:
+                        retry_api_spinner.stop(f"Retry completed in {duration:.1f} seconds")
+                except Exception as e:
+                    # Ensure monitoring is stopped on error
+                    if retry_connection_monitor:
+                        retry_connection_monitor.stop_monitoring()
+                    if retry_api_spinner:
+                        retry_api_spinner.stop(f"Retry failed: {str(e)}")
+                    raise  # Re-raise the exception
                 
-                # Stop the retry connection monitor
-                retry_connection_monitor.stop_monitoring()
-                
-                end_time = time.time()
-                duration = end_time - start_time
-                retry_api_spinner.stop(f"Retry completed in {duration:.1f} seconds")
-                
-                # Update tokens and cost with retry request
+                # Track retry token usage and cost
                 retry_input_tokens = message.usage.input_tokens
                 retry_output_tokens = message.usage.output_tokens
-                retry_total_tokens = retry_input_tokens + retry_output_tokens
+                total_tokens += (retry_input_tokens + retry_output_tokens)
                 
-                # Add to previous usage
-                total_tokens += retry_total_tokens
-                
-                # Update cost
+                # Calculate retry cost
                 retry_cost = estimate_cost(model, retry_input_tokens, retry_output_tokens)
                 cost += retry_cost
                 
@@ -463,12 +500,20 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
         finally:
             # Always cancel the alarm when done with the API call
             signal.alarm(0)
+            
+            # Restore original signal handler if we set one
             if old_handler:
-                signal.signal(signal.SIGALRM, old_handler)
+                try:
+                    signal.signal(signal.SIGALRM, old_handler)
+                except Exception:
+                    pass  # Ignore errors in signal handling restoration
             
             # Stop the connection monitor if it exists
             if connection_monitor:
-                connection_monitor.stop_monitoring()
+                try:
+                    connection_monitor.stop_monitoring()
+                except Exception:
+                    pass
     
     except TimeoutError as e:
         error(f"API request timed out: {str(e)}")
@@ -555,10 +600,9 @@ def process_document_in_chunks(client, text_file, original_text, review_notes, i
                     {"role": "user", "content": chunk_prompt}
                 ]
             )
-            processing_time = time.time() - start_time
             
-            # Stop the connection monitor
-            connection_monitor.stop_monitoring()
+            # Immediately stop monitoring
+            processing_time = time.time() - start_time
             
             # Extract the edited chunk
             edited_chunk = message.content[0].text
@@ -573,13 +617,19 @@ def process_document_in_chunks(client, text_file, original_text, review_notes, i
             chunk_cost = estimate_cost(model, input_tokens, output_tokens)
             total_cost += chunk_cost
             
+            # Stop the connection monitor
+            if connection_monitor:
+                connection_monitor.stop_monitoring()
+            
+            # Stop the spinner with completion message
+            if api_spinner:
+                api_spinner.stop(f"Chunk {chunk_num}/{len(chunks)} complete in {processing_time:.1f}s (${chunk_cost:.4f})")
+            
             # Clean up the response
             edited_chunk = cleanup_response(edited_chunk)
             
             # Add to our list of edited chunks
             edited_chunks.append(edited_chunk)
-            
-            api_spinner.stop(f"Chunk {chunk_num}/{len(chunks)} complete in {processing_time:.1f}s (${chunk_cost:.4f})")
             
             # Display progress
             progress_pct = (chunk_num / len(chunks)) * 100
@@ -630,26 +680,49 @@ def process_document_in_chunks(client, text_file, original_text, review_notes, i
 
 def get_max_tokens_for_model(model):
     """Get appropriate max_tokens value based on model"""
+    # Define max tokens for each model version
+    max_tokens_map = {
+        "claude-3-opus-20240229": 12000,
+        "claude-3-sonnet-20240229": 8000,
+        "claude-3-haiku-20240307": 4000,
+        "claude-3-5-sonnet-20240620": 8000,
+        "claude-3-5-haiku-20240620": 4000,
+        "claude-3-7-sonnet-20250219": 12000,
+        "claude-2.1": 4000,
+    }
+    
+    # Try exact match first
+    if model in max_tokens_map:
+        return max_tokens_map[model]
+    
+    # Try to match by model family
     if "3-7" in model:
         return 12000  # Claude 3.7 has large context capacity
+    elif "3-5" in model and "haiku" in model:
+        return 4000
+    elif "3-5" in model and "sonnet" in model:
+        return 8000
     elif "haiku" in model:
         return 4000
     elif "sonnet" in model:
         return 8000
     elif "opus" in model:
         return 12000
-    else:
-        return 4000  # Default to a conservative value
+    elif "2.1" in model:
+        return 4000
+    
+    # Default to a conservative value
+    return 4000
 
 def get_available_models():
     """Return a dictionary of available Claude models with their descriptions"""
     return {
-        "claude-3-7-sonnet-20250219": "Claude 3.7 Sonnet - Latest high performance model",
-        "claude-3-5-sonnet-20240620": "Latest balanced model",
-        "claude-3-opus": "Highest quality, most expensive",
-        "claude-3-sonnet": "Good balance of quality and cost",
-        "claude-3-haiku": "Fastest and most affordable",
-        "claude-3-5-haiku-20240620": "Latest affordable model with good performance"
+        "claude-3-5-sonnet-20240620": "Claude 3.5 Sonnet - Latest balanced model",
+        "claude-3-5-haiku-20240620": "Claude 3.5 Haiku - Latest affordable model",
+        "claude-3-opus-20240229": "Claude 3 Opus - Highest quality, most expensive",
+        "claude-3-sonnet-20240229": "Claude 3 Sonnet - Good balance of quality and cost",
+        "claude-3-haiku-20240307": "Claude 3 Haiku - Fastest and most affordable",
+        "claude-2.1": "Claude 2.1 - Older model, still reliable"
     }
 
 def sanitize_custom_id(filename):
@@ -692,23 +765,51 @@ def process_batch_item(client, text_file, model, instructions_content, output_fo
 
     # Send to Claude
     try:
-        spinner = Spinner(f"Sending request to Claude API ({model})...").start()
-        start_time = time.time()
+        # Create a connection monitor
+        connection_monitor = AnthropicConnectionMonitor(client, timeout=180)
         
-        message = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=0.85,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
+        # Use a connection monitoring spinner
+        api_spinner = ConnectionMonitoringSpinner(
+            message=f"Sending request to Claude API ({model})...",
+            check_interval=3,
+            timeout=240
+        ).start_request()
         
-        duration = time.time() - start_time
-        spinner.stop(f"Request completed in {duration:.1f} seconds")
+        # Start monitoring the connection with estimated tokens
+        estimated_tokens = len(prompt.split()) * 1.3  # Rough estimate
+        connection_monitor.start_request(api_spinner, estimated_tokens=estimated_tokens, model=model)
         
-        # Extract the edited text
-        edited_text = message.content[0].text
+        try:
+            start_time = time.time()
+            message = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=0.85,
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            
+            # Calculate time taken
+            duration = time.time() - start_time
+            
+            # Stop the connection monitor 
+            if connection_monitor:
+                connection_monitor.stop_monitoring()
+            
+            # Stop the spinner
+            if api_spinner:
+                api_spinner.stop(f"Request completed in {duration:.1f} seconds")
+                
+            # Extract the edited text
+            edited_text = message.content[0].text
+        except Exception as e:
+            # Ensure monitoring is stopped on error
+            if connection_monitor:
+                connection_monitor.stop_monitoring()
+            if api_spinner:
+                api_spinner.stop(f"Request failed: {str(e)}")
+            raise  # Re-raise the exception
         
         # Track token usage and cost
         input_tokens = message.usage.input_tokens
@@ -761,21 +862,48 @@ def process_batch_item(client, text_file, model, instructions_content, output_fo
             retrying_prompt += "## YOUR CORRECTED EDIT (FULL LENGTH)\n"
             spinner.stop("Retry prompt ready")
             
-            # Try again with stronger instructions
-            spinner = Spinner("Sending retry request...").start()
-            start_time = time.time()
+            # Create a connection monitor for the retry
+            retry_connection_monitor = AnthropicConnectionMonitor(client, timeout=180)
             
-            message = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=0.85,
-                messages=[
-                    {"role": "user", "content": retrying_prompt}
-                ]
-            )
+            # Try again with real status monitoring
+            retry_api_spinner = ConnectionMonitoringSpinner(
+                message="Sending retry request to Claude API...",
+                check_interval=3,
+                timeout=240
+            ).start_request()
             
-            duration = time.time() - start_time
-            spinner.stop(f"Retry completed in {duration:.1f} seconds")
+            # Start monitoring the retry connection
+            retry_estimated_tokens = len(retrying_prompt.split()) * 1.3  # Rough estimate
+            retry_connection_monitor.start_request(retry_api_spinner, estimated_tokens=retry_estimated_tokens, model=model)
+            
+            try:
+                start_time = time.time()
+                message = client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=0.85,
+                    messages=[
+                        {"role": "user", "content": retrying_prompt}
+                    ]
+                )
+                
+                # Calculate time taken
+                duration = time.time() - start_time
+                
+                # Stop the connection monitor
+                if retry_connection_monitor:
+                    retry_connection_monitor.stop_monitoring()
+                
+                # Stop the spinner
+                if retry_api_spinner:
+                    retry_api_spinner.stop(f"Retry completed in {duration:.1f} seconds")
+            except Exception as e:
+                # Ensure monitoring is stopped on error
+                if retry_connection_monitor:
+                    retry_connection_monitor.stop_monitoring()
+                if retry_api_spinner:
+                    retry_api_spinner.stop(f"Retry failed: {str(e)}")
+                raise  # Re-raise the exception
             
             # Track retry token usage and cost
             retry_input_tokens = message.usage.input_tokens
@@ -833,25 +961,25 @@ def batch_edit_texts(client, text_files, model, instructions_content, output_for
     processed_count = 0
     skipped_count = 0
     
-    # Filter files that need editing
-    spinner = Spinner("Checking files to process...").start()
-    files_to_edit = []
+    # Filter files to only those with review notes
+    spinner = Spinner("Checking for files with review notes...").start()
+    files_with_notes = []
     for text_file in text_files:
-        if is_already_edited(text_file, model):
-            skipped_count += 1
+        if get_review_notes(text_file):
+            files_with_notes.append(text_file)
         else:
-            files_to_edit.append(text_file)
+            skipped_count += 1
     
-    if not files_to_edit:
-        spinner.stop("No files need editing")
-        info("All files have already been processed.")
+    if not files_with_notes:
+        spinner.stop("No files with review notes found")
+        warning("No files with review notes found. Add review notes to process files.")
         return
     
-    spinner.stop(f"Found {len(files_to_edit)} files to process ({skipped_count} skipped)")
+    spinner.stop(f"Found {len(files_with_notes)} files with review notes (skipped {skipped_count})")
     
     # Display large document warnings if applicable
     large_docs = []
-    for text_file in files_to_edit:
+    for text_file in files_with_notes:
         # Check file size
         spinner = Spinner(f"Analyzing {os.path.basename(text_file)}...").start()
         try:
@@ -886,10 +1014,10 @@ def batch_edit_texts(client, text_files, model, instructions_content, output_for
                 return
     
     # Process files individually
-    success(f"Processing {len(files_to_edit)} files...")
+    success(f"Processing {len(files_with_notes)} files...")
     
-    for i, text_file in enumerate(files_to_edit):
-        print_subheader(f"BATCH ITEM {i+1}/{len(files_to_edit)}: {text_file}")
+    for i, text_file in enumerate(files_with_notes):
+        print_subheader(f"BATCH ITEM {i+1}/{len(files_with_notes)}: {text_file}")
         
         # Record token count before processing
         pre_tokens = get_total_tokens_used(client, model)
@@ -925,8 +1053,8 @@ def batch_edit_texts(client, text_files, model, instructions_content, output_for
             processed_count += 1
         
         # Show progress
-        progress_pct = ((i + 1) / len(files_to_edit)) * 100
-        info(f"Batch progress: {progress_pct:.1f}% ({i+1}/{len(files_to_edit)} files)")
+        progress_pct = ((i + 1) / len(files_with_notes)) * 100
+        info(f"Batch progress: {progress_pct:.1f}% ({i+1}/{len(files_with_notes)} files)")
         info(f"Running cost: ${batch_total_cost:.4f} ({batch_total_tokens} tokens)")
         
     # Final summary
@@ -1050,24 +1178,41 @@ def estimate_cost(model, input_tokens, output_tokens):
     """Estimate the cost of API usage based on model and tokens"""
     # Claude pricing as of July 2024 (subject to change)
     pricing = {
-        "claude-3-opus": {"input": 15.0, "output": 75.0},
-        "claude-3-sonnet": {"input": 3.0, "output": 15.0},
-        "claude-3-haiku": {"input": 0.25, "output": 1.25},
-        "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
-        "claude-3-5-haiku": {"input": 0.25, "output": 1.25},
-        "claude-3-7-sonnet": {"input": 5.0, "output": 15.0},
+        "claude-3-opus-20240229": {"input": 15.0, "output": 75.0},
+        "claude-3-sonnet-20240229": {"input": 3.0, "output": 15.0},
+        "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25},
+        "claude-3-5-sonnet-20240620": {"input": 3.0, "output": 15.0},
+        "claude-3-5-haiku-20240620": {"input": 0.25, "output": 1.25},
+        "claude-3-7-sonnet-20250219": {"input": 5.0, "output": 15.0},
+        "claude-2.1": {"input": 0.8, "output": 2.4},
     }
     
     # Find the right pricing tier
     model_pricing = None
-    for model_key, price in pricing.items():
-        if model_key in model:
-            model_pricing = price
-            break
+    
+    # Try exact match first
+    if model in pricing:
+        model_pricing = pricing[model]
+    else:
+        # Try partial match based on model family
+        if "3-7" in model and "sonnet" in model:
+            model_pricing = pricing["claude-3-7-sonnet-20250219"]
+        elif "3-5" in model and "sonnet" in model:
+            model_pricing = pricing["claude-3-5-sonnet-20240620"]
+        elif "3-5" in model and "haiku" in model:
+            model_pricing = pricing["claude-3-5-haiku-20240620"]
+        elif "opus" in model:
+            model_pricing = pricing["claude-3-opus-20240229"]
+        elif "sonnet" in model:
+            model_pricing = pricing["claude-3-sonnet-20240229"]
+        elif "haiku" in model:
+            model_pricing = pricing["claude-3-haiku-20240307"]
+        elif "2.1" in model:
+            model_pricing = pricing["claude-2.1"]
     
     # If model not found, use haiku pricing (lowest) as fallback
     if not model_pricing:
-        model_pricing = pricing["claude-3-haiku"]
+        model_pricing = pricing["claude-3-haiku-20240307"]
     
     # Calculate cost (price is per million tokens, so divide by 1,000,000)
     input_cost = (input_tokens * model_pricing["input"]) / 1000000
@@ -1139,23 +1284,42 @@ def estimate_processing_time(word_count, model):
     """
     # Base processing rates (words per second) for different models
     # These are rough estimates and may need adjustment
-    rates = {
-        "opus": 500,      # Claude 3 Opus - most thorough, slowest
-        "sonnet": 800,    # Claude 3 Sonnet - balanced
-        "haiku": 1200,    # Claude 3 Haiku - fastest
+    processing_speeds = {
+        "claude-3-opus-20240229": 500,     # Claude 3 Opus - most thorough, slowest
+        "claude-3-sonnet-20240229": 800,   # Claude 3 Sonnet - balanced
+        "claude-3-haiku-20240307": 1200,   # Claude 3 Haiku - fastest
+        "claude-3-5-sonnet-20240620": 850, # Claude 3.5 Sonnet - slightly faster than 3
+        "claude-3-5-haiku-20240620": 1300, # Claude 3.5 Haiku - fastest
+        "claude-3-7-sonnet-20250219": 900, # Claude 3.7 Sonnet - high performance
+        "claude-2.1": 700,                 # Claude 2.1 - older model
     }
     
-    # Default to sonnet rate if model not recognized
-    rate = rates.get("sonnet", 800)
+    # Default to Claude 3 Sonnet rate if model not recognized
+    rate = 800  # Default processing rate
     
-    # Determine which rate to use based on model name
-    for model_type, processing_rate in rates.items():
-        if model_type in model.lower():
-            rate = processing_rate
-            break
+    # Try exact match first
+    if model in processing_speeds:
+        rate = processing_speeds[model]
+    else:
+        # Try partial match based on model family
+        if "3-7" in model and "sonnet" in model:
+            rate = processing_speeds["claude-3-7-sonnet-20250219"]
+        elif "3-5" in model and "sonnet" in model:
+            rate = processing_speeds["claude-3-5-sonnet-20240620"]
+        elif "3-5" in model and "haiku" in model:
+            rate = processing_speeds["claude-3-5-haiku-20240620"]
+        elif "opus" in model:
+            rate = processing_speeds["claude-3-opus-20240229"]
+        elif "sonnet" in model:
+            rate = processing_speeds["claude-3-sonnet-20240229"]
+        elif "haiku" in model:
+            rate = processing_speeds["claude-3-haiku-20240307"]
+        elif "2.1" in model:
+            rate = processing_speeds["claude-2.1"]
     
     # Calculate estimated time in minutes
-    estimated_seconds = word_count / rate
+    # Add a base overhead time for API setup, etc.
+    estimated_seconds = (word_count / rate) + 5
     return estimated_seconds / 60
 
 class AnthropicConnectionMonitor:
@@ -1177,6 +1341,7 @@ class AnthropicConnectionMonitor:
         self.connection_status = "Initializing"
         self.lock = threading.Lock()
         self.request_in_progress = False
+        self.request_completed = False  # Flag to indicate request has completed
         self.request_start_time = None
         self.expected_duration = None
         self.estimated_tokens = 0
@@ -1184,20 +1349,29 @@ class AnthropicConnectionMonitor:
     def start_request(self, spinner, estimated_tokens=0, model=""):
         """Start monitoring a request"""
         self.request_in_progress = True
+        self.request_completed = False  # Reset completion flag
         self.request_start_time = time.time()
         self.last_heartbeat = time.time()
         
         # Estimate expected duration based on token count and model
         self.estimated_tokens = estimated_tokens
-        words_per_second = 600  # Default processing rate
+        words_per_second = 800  # Default to Sonnet processing rate
         
         # Adjust based on model
         if "opus" in model.lower():
             words_per_second = 500
+        elif "3-7" in model.lower() and "sonnet" in model.lower():
+            words_per_second = 900
+        elif "3-5" in model.lower() and "sonnet" in model.lower():
+            words_per_second = 850
+        elif "3-5" in model.lower() and "haiku" in model.lower():
+            words_per_second = 1300
         elif "sonnet" in model.lower():
             words_per_second = 800
         elif "haiku" in model.lower():
             words_per_second = 1200
+        elif "2.1" in model.lower():
+            words_per_second = 700
             
         # Add base overhead (API setup, etc.)
         self.expected_duration = (estimated_tokens / 1.3) / words_per_second + 5
@@ -1221,6 +1395,13 @@ class AnthropicConnectionMonitor:
     def _heartbeat_loop(self, spinner):
         """Background thread that updates connection status"""
         while not self.stop_heartbeat.is_set():
+            # Check if the request is explicitly marked as completed
+            if self.request_completed:
+                # Stop monitoring automatically if request is completed
+                self.stop_heartbeat.set()
+                self.request_in_progress = False
+                break
+                
             if self.request_in_progress:
                 # Calculate elapsed time
                 elapsed_time = time.time() - self.request_start_time
@@ -1270,10 +1451,14 @@ class AnthropicConnectionMonitor:
     def stop_monitoring(self):
         """Stop the heartbeat thread and cleanup"""
         self.request_in_progress = False
+        self.request_completed = True  # Mark the request as explicitly completed
         self.stop_heartbeat.set()
         
         if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-            self.heartbeat_thread.join(timeout=1.0)
+            try:
+                self.heartbeat_thread.join(timeout=1.0)
+            except Exception:
+                pass  # Ignore any issues with thread joining
             
         return self
 
@@ -1281,7 +1466,7 @@ def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Book Editor Agent using Claude AI")
     parser.add_argument("--model", "-m", 
-                        default="claude-3-haiku",
+                        default="claude-3-haiku-20240307",
                         help="Claude model to use for editing")
     parser.add_argument("--list-models", "-l", action="store_true",
                         help="List available Claude models with descriptions")
@@ -1293,6 +1478,9 @@ def main():
                         help="Output format for edited files (txt, docx, or same as input)")
     parser.add_argument("--chunk-size", type=int, default=0,
                         help="Split large documents into chunks of this many words (0 disables chunking)")
+    parser.add_argument("--only-with-notes", action="store_true",
+                        help="Only process files that have review notes")
+    parser.add_argument("file", nargs="?", help="Specific file to process (optional)")
     
     args = parser.parse_args()
     
@@ -1301,18 +1489,22 @@ def main():
         print_header("AVAILABLE CLAUDE MODELS")
         models = get_available_models()
         # Display models with their pricing
-        print_subheader("Model | Input Price | Output Price")
-        print_subheader("------|-------------|------------")
+        print_subheader("Model | Input Price | Output Price | Description")
+        print_subheader("------|-------------|-------------|------------")
         for model, description in models.items():
             # Get pricing information
             if "opus" in model:
                 input_price, output_price = "$15.00", "$75.00"
-            elif "sonnet" in model and "3-7" in model:
+            elif "3-7" in model and "sonnet" in model:
                 input_price, output_price = "$5.00", "$15.00"
+            elif "3-5" in model and "sonnet" in model:
+                input_price, output_price = "$3.00", "$15.00"
             elif "sonnet" in model:
                 input_price, output_price = "$3.00", "$15.00"
             elif "haiku" in model:
                 input_price, output_price = "$0.25", "$1.25"
+            elif "2.1" in model:
+                input_price, output_price = "$0.80", "$2.40"
             else:
                 input_price, output_price = "Unknown", "Unknown"
                 
@@ -1339,7 +1531,7 @@ def main():
     
     # Get text files
     spinner = Spinner("Finding text files...").start()
-    text_files = get_text_files()
+    text_files = get_text_files(args.file)
     
     if not text_files:
         spinner.stop("No files found")
@@ -1365,9 +1557,13 @@ def main():
         info(f"Model: {args.model} (Premium tier - most expensive)")
         info(f"Input pricing: $15.00 per million tokens")
         info(f"Output pricing: $75.00 per million tokens")
-    elif "sonnet" in args.model and "3-7" in args.model:
+    elif "3-7" in args.model and "sonnet" in args.model:
         info(f"Model: {args.model} (High-performance tier)")
         info(f"Input pricing: $5.00 per million tokens")
+        info(f"Output pricing: $15.00 per million tokens")
+    elif "3-5" in args.model and "sonnet" in args.model:
+        info(f"Model: {args.model} (Standard tier)")
+        info(f"Input pricing: $3.00 per million tokens")
         info(f"Output pricing: $15.00 per million tokens")
     elif "sonnet" in args.model:
         info(f"Model: {args.model} (Standard tier)")
@@ -1385,8 +1581,20 @@ def main():
         batch_edit_texts(client, text_files, args.model, instructions_content, args.output_format, args.chunk_size)
     else:
         # Process files individually
+        files_processed = 0
         for text_file in text_files:
-            edit_text_with_claude(client, text_file, args.model, instructions_content, args.output_format, args.chunk_size)
+            # Only process files that have review notes
+            review_notes = get_review_notes(text_file)
+            if review_notes:
+                edit_text_with_claude(client, text_file, args.model, instructions_content, args.output_format, args.chunk_size)
+                files_processed += 1
+            else:
+                info(f"Skipping {text_file} - no review notes found.")
+        
+        if files_processed == 0:
+            warning("No files with review notes were found. Add review notes to process files.")
+        else:
+            success(f"Processed {files_processed} files with review notes.")
             
     success("Book editing process complete!")
 
