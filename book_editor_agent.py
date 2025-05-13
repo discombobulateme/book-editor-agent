@@ -6,6 +6,7 @@ import time
 import re
 import argparse
 import traceback
+import docx
 
 # Import our terminal colors utility
 from terminal_colors import Colors, print_header, print_subheader, print_stats, success, warning, error, info, debug
@@ -26,25 +27,45 @@ def create_anthropic_client(api_key):
     return anthropic.Anthropic(api_key=api_key)
 
 def get_text_files():
-    """Get a list of text files from the original-texts directory"""
-    return glob.glob("original-texts/*.txt")
+    """Get a list of text files (.txt and .docx) from the original-texts directory"""
+    return glob.glob("original-texts/*.txt") + glob.glob("original-texts/*.docx")
 
 def get_review_notes(filename):
     """Get review notes for a text file if they exist"""
     base_name = os.path.basename(filename)
-    review_file = os.path.join("review-notes", base_name)
+    name, ext = os.path.splitext(base_name)
+    
+    # Check for a txt review file first
+    review_file = os.path.join("review-notes", f"{name}.txt")
     
     if os.path.exists(review_file):
         with open(review_file, "r") as f:
             return f.read()
+    
+    # If not found, check for a docx review file
+    docx_review_file = os.path.join("review-notes", f"{name}.docx")
+    if os.path.exists(docx_review_file):
+        return read_docx_content(docx_review_file)
+    
     return None
 
 def read_file_content(filename):
     """Read the content of a file"""
+    if filename.endswith('.docx'):
+        return read_docx_content(filename)
     with open(filename, "r") as f:
         return f.read()
 
-def save_edited_text(filename, edited_content, model_name):
+def read_docx_content(filename):
+    """Read content from a .docx file"""
+    doc = docx.Document(filename)
+    full_text = []
+    for para in doc.paragraphs:
+        if para.text:
+            full_text.append(para.text)
+    return '\n\n'.join(full_text)
+
+def save_edited_text(filename, edited_content, model_name, output_format="same"):
     """Save the edited text to the edited-texts directory with model name in filename"""
     # Extract just the filename from the path
     base_name = os.path.basename(filename)
@@ -58,22 +79,43 @@ def save_edited_text(filename, edited_content, model_name):
     # Get a shortened model identifier
     model_id = model_name
     
-    # Create output path
-    output_path = os.path.join("edited-texts", f"{name}-{model_id}{ext}")
+    # Determine output extension based on format preference
+    if output_format == "same":
+        output_ext = ext
+    else:
+        output_ext = f".{output_format}"
+    
+    # Create output path with the determined extension
+    output_path = os.path.join("edited-texts", f"{name}-{model_id}{output_ext}")
     
     # Check if the file already exists and add a version number if it does
     version = 1
     while os.path.exists(output_path):
         # Increment version number and create a new filename
-        output_path = os.path.join("edited-texts", f"{name}-{model_id}-{version}{ext}")
+        output_path = os.path.join("edited-texts", f"{name}-{model_id}-{version}{output_ext}")
         version += 1
     
-    # Write the edited content to the file
-    with open(output_path, "w") as f:
-        f.write(edited_content)
+    # Write the edited content to the file based on file type
+    if output_ext.lower() == '.docx':
+        save_docx_content(output_path, edited_content)
+    else:
+        with open(output_path, "w") as f:
+            f.write(edited_content)
     
     info(f"Saved edited text to {output_path}")
     return output_path
+
+def save_docx_content(output_path, content):
+    """Save content to a .docx file with formatting"""
+    doc = docx.Document()
+    
+    # Split content into paragraphs and add them to the document
+    paragraphs = content.split('\n\n')
+    for p in paragraphs:
+        if p.strip():
+            doc.add_paragraph(p.strip())
+    
+    doc.save(output_path)
 
 def create_editing_prompt(original_text, review_notes, instructions_content):
     """Create a prompt for the AI to edit the text"""
@@ -111,9 +153,10 @@ def is_already_edited(filename, model):
     base_name = os.path.basename(filename)
     name, ext = os.path.splitext(base_name)
     
-    # Check if an edited version exists
-    edited_glob = os.path.join("edited-texts", f"{name}-{model}*{ext}")
-    edited_files = glob.glob(edited_glob)
+    # Check if an edited version exists (either txt or docx extension)
+    edited_glob_txt = os.path.join("edited-texts", f"{name}-{model}*.txt")
+    edited_glob_docx = os.path.join("edited-texts", f"{name}-{model}*.docx")
+    edited_files = glob.glob(edited_glob_txt) + glob.glob(edited_glob_docx)
     
     # If no edited version exists, the file needs editing
     if not edited_files:
@@ -127,7 +170,7 @@ def is_already_edited(filename, model):
     # File has been edited and no review notes exist
     return True
 
-def edit_text_with_claude(client, text_file, model, instructions_content):
+def edit_text_with_claude(client, text_file, model, instructions_content, output_format="same"):
     """Edit a text file using Claude"""
     # Check if the file has already been edited by this model and has no review notes
     if is_already_edited(text_file, model):
@@ -258,7 +301,7 @@ def edit_text_with_claude(client, text_file, model, instructions_content):
                 warning("AI still produced shortened text. Saving anyway, but please review.")
         
         # Save the edited text
-        output_path = save_edited_text(text_file, edited_text, model)
+        output_path = save_edited_text(text_file, edited_text, model, output_format)
         
         # Print final statistics
         final_word_count = len(edited_text.split())
@@ -283,7 +326,9 @@ def edit_text_with_claude(client, text_file, model, instructions_content):
 
 def get_max_tokens_for_model(model):
     """Get appropriate max_tokens value based on model"""
-    if "haiku" in model:
+    if "3-7" in model:
+        return 12000  # Claude 3.7 has large context capacity
+    elif "haiku" in model:
         return 4000
     elif "sonnet" in model:
         return 8000
@@ -295,12 +340,12 @@ def get_max_tokens_for_model(model):
 def get_available_models():
     """Return a dictionary of available Claude models with their descriptions"""
     return {
-        "claude-3-5-sonnet-20240620": "Balanced performance and cost",
-        "claude-3-opus-20240229": "Highest quality, most expensive",
-        "claude-3-sonnet-20240229": "Good balance of quality and cost",
-        "claude-3-haiku-20240307": "Fastest and most affordable",
-        "claude-3-5-haiku-20240620": "Latest affordable model with good performance",
-        "claude-3-5-sonnet-20240620": "Latest balanced model"
+        "claude-3-7-sonnet-20250219": "Claude 3.7 Sonnet - Latest high performance model",
+        "claude-3-5-sonnet-20240620": "Latest balanced model",
+        "claude-3-opus": "Highest quality, most expensive",
+        "claude-3-sonnet": "Good balance of quality and cost",
+        "claude-3-haiku": "Fastest and most affordable",
+        "claude-3-5-haiku-20240620": "Latest affordable model with good performance"
     }
 
 def sanitize_custom_id(filename):
@@ -314,7 +359,7 @@ def sanitize_custom_id(filename):
         sanitized = sanitized[:64]
     return sanitized
 
-def process_batch_item(client, text_file, model, instructions_content):
+def process_batch_item(client, text_file, model, instructions_content, output_format="same"):
     """Process a single item from a batch, with validation and cleanup"""
     # Read the text file
     original_text = read_file_content(text_file)
@@ -411,7 +456,7 @@ def process_batch_item(client, text_file, model, instructions_content):
                 warning(f"Batch item {text_file} still produced shortened text. Saving anyway.")
         
         # Save the edited text
-        output_path = save_edited_text(text_file, edited_text, model)
+        output_path = save_edited_text(text_file, edited_text, model, output_format)
         success(f"Saved edited text to {output_path}")
         
         return edited_text
@@ -419,7 +464,7 @@ def process_batch_item(client, text_file, model, instructions_content):
         error(f"Error processing batch item {text_file}: {e}")
         return None
 
-def batch_edit_texts(client, text_files, model, instructions_content):
+def batch_edit_texts(client, text_files, model, instructions_content, output_format="same"):
     """Process multiple text files in a batch request"""
     if not text_files:
         warning("No text files found in original-texts directory.")
@@ -442,7 +487,7 @@ def batch_edit_texts(client, text_files, model, instructions_content):
     
     for i, text_file in enumerate(files_to_edit):
         print_subheader(f"BATCH ITEM {i+1}/{len(files_to_edit)}: {text_file}")
-        process_batch_item(client, text_file, model, instructions_content)
+        process_batch_item(client, text_file, model, instructions_content, output_format)
         
     success("Batch processing complete!")
 
@@ -550,12 +595,16 @@ def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Book Editor Agent using Claude AI")
     parser.add_argument("--model", "-m", 
-                        default="claude-3-haiku-20240307",
+                        default="claude-3-haiku",
                         help="Claude model to use for editing")
     parser.add_argument("--list-models", "-l", action="store_true",
                         help="List available Claude models with descriptions")
     parser.add_argument("--batch", "-b", action="store_true",
                         help="Process files in batch mode")
+    parser.add_argument("--output-format", "-o", 
+                        choices=["txt", "docx", "same"],
+                        default="same",
+                        help="Output format for edited files (txt, docx, or same as input)")
     
     args = parser.parse_args()
     
@@ -584,10 +633,11 @@ def main():
     text_files = get_text_files()
     
     if not text_files:
-        warning("No text files found in original-texts directory.")
+        warning("No text files (.txt or .docx) found in original-texts directory.")
         return
     
     info(f"Found {len(text_files)} text files to process")
+    info(f"Output format: {args.output_format}")
     
     # Read instructions for style guidelines
     try:
@@ -601,11 +651,11 @@ def main():
     if args.batch:
         # Process files in batch
         print_header(f"BATCH PROCESSING {len(text_files)} FILES WITH {args.model}")
-        batch_edit_texts(client, text_files, args.model, instructions_content)
+        batch_edit_texts(client, text_files, args.model, instructions_content, args.output_format)
     else:
         # Process files individually
         for text_file in text_files:
-            edit_text_with_claude(client, text_file, args.model, instructions_content)
+            edit_text_with_claude(client, text_file, args.model, instructions_content, args.output_format)
             
     success("Book editing process complete!")
 
