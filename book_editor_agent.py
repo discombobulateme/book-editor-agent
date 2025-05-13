@@ -9,7 +9,7 @@ import traceback
 import docx
 
 # Import our terminal colors utility
-from terminal_colors import Colors, print_header, print_subheader, print_stats, success, warning, error, info, debug
+from terminal_colors import Colors, print_header, print_subheader, print_stats, success, warning, error, info, debug, Spinner
 
 # Load environment variables
 load_dotenv()
@@ -180,21 +180,28 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
     print_header(f"PROCESSING: {text_file} with model {model}")
     
     # Read the text file
+    spinner = Spinner("Reading input file...").start()
     original_text = read_file_content(text_file)
+    spinner.stop(f"Read input file: {text_file}")
     
     # Get review notes if they exist
+    spinner = Spinner("Checking for review notes...").start()
     review_notes = get_review_notes(text_file)
     
     if review_notes:
+        spinner.stop("Found review notes")
         print_subheader("📝 REVIEW NOTES FOUND")
         info(review_notes)
     else:
+        spinner.stop("No review notes found")
         info("📋 No review notes found. Proceeding with standard editing.")
     
     # Get text statistics for original text
+    spinner = Spinner("Analyzing text...").start()
     original_word_count = len(original_text.split())
     original_char_count = len(original_text)
     original_paragraphs = len([p for p in original_text.split('\n\n') if p.strip()])
+    spinner.stop("Text analysis complete")
     
     print_subheader("📊 ORIGINAL TEXT STATISTICS")
     print_stats("Words", original_word_count)
@@ -202,15 +209,19 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
     print_stats("Paragraphs", original_paragraphs)
     
     # Create prompt
+    spinner = Spinner("Preparing editing prompt...").start()
     prompt = create_editing_prompt(original_text, review_notes, instructions_content)
+    
+    # Estimate token count and cost
+    input_tokens = len(prompt.split()) * 1.3  # Rough estimate: words * 1.3
+    spinner.stop(f"Prompt prepared (~{int(input_tokens)} estimated tokens)")
     
     # Set max_tokens based on model
     max_tokens = get_max_tokens_for_model(model)
 
     # Send to Claude
     try:
-        info("🚀 Sending request to Claude API")
-        info("⏳ This may take some time depending on the length of your text...")
+        spinner = Spinner(f"Sending request to Claude API ({model})... This may take some time").start()
         
         start_time = time.time()
         message = client.messages.create(
@@ -224,19 +235,37 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
         end_time = time.time()
         
         duration = end_time - start_time
-        success(f"Request completed in {duration:.1f} seconds")
+        spinner.stop(f"Request completed in {duration:.1f} seconds")
         
         # Extract the edited text
         edited_text = message.content[0].text
         
+        # Calculate tokens and cost
+        input_tokens = message.usage.input_tokens
+        output_tokens = message.usage.output_tokens
+        total_tokens = input_tokens + output_tokens
+        
+        # Estimate cost based on model
+        cost = estimate_cost(model, input_tokens, output_tokens)
+        
+        # Display token usage and cost
+        print_subheader("💰 API USAGE")
+        print_stats("Input tokens", input_tokens)
+        print_stats("Output tokens", output_tokens)
+        print_stats("Total tokens", total_tokens)
+        print_stats("Estimated cost", f"${cost:.4f} USD")
+        
         # Clean up the response to remove any metadata
-        info("🧹 Cleaning up any metadata or formatting...")
+        spinner = Spinner("Cleaning up response...").start()
         edited_text = cleanup_response(edited_text)
+        spinner.stop("Response cleaned")
         
         # Get word count stats for edited text
+        spinner = Spinner("Analyzing edited text...").start()
         edited_word_count = len(edited_text.split())
         edited_char_count = len(edited_text)
         edited_paragraphs = len([p for p in edited_text.split('\n\n') if p.strip()])
+        spinner.stop("Analysis complete")
         
         print_subheader("📊 EDITED TEXT STATISTICS")
         print_stats("Words", edited_word_count, original_word_count)
@@ -244,10 +273,15 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
         print_stats("Paragraphs", edited_paragraphs, original_paragraphs)
         
         # Validate the edited text
-        if not validate_edited_text(original_text, edited_text, review_notes):
+        spinner = Spinner("Validating edited text...").start()
+        validation_result = validate_edited_text(original_text, edited_text, review_notes)
+        
+        if not validation_result:
+            spinner.stop("Validation failed - text appears to be shortened")
             warning("Attempting to regenerate edited text...")
             
             # Add stronger instructions to prevent shortening
+            spinner = Spinner("Preparing retry prompt...").start()
             retrying_prompt = (
                 "You are a professional editor skilled in enhancing text without losing content or nuance.\n\n"
                 
@@ -273,8 +307,12 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
             
             retrying_prompt += "## YOUR CORRECTED EDIT (FULL LENGTH)\n"
             
+            # Estimate token count for retry
+            retry_input_tokens = len(retrying_prompt.split()) * 1.3  # Rough estimate
+            spinner.stop(f"Retry prompt prepared (~{int(retry_input_tokens)} estimated tokens)")
+            
             # Try again with stronger instructions
-            info("🔄 Sending request with stronger instructions...")
+            spinner = Spinner("Sending retry request to Claude API... This may take some time").start()
             
             start_time = time.time()
             message = client.messages.create(
@@ -288,20 +326,47 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
             end_time = time.time()
             
             duration = end_time - start_time
-            success(f"Request completed in {duration:.1f} seconds")
+            spinner.stop(f"Retry completed in {duration:.1f} seconds")
+            
+            # Update tokens and cost with retry request
+            retry_input_tokens = message.usage.input_tokens
+            retry_output_tokens = message.usage.output_tokens
+            retry_total_tokens = retry_input_tokens + retry_output_tokens
+            
+            # Add to previous usage
+            total_tokens += retry_total_tokens
+            
+            # Update cost
+            retry_cost = estimate_cost(model, retry_input_tokens, retry_output_tokens)
+            cost += retry_cost
+            
+            # Display updated token usage and cost
+            print_subheader("💰 TOTAL API USAGE (INITIAL + RETRY)")
+            print_stats("Total tokens", total_tokens)
+            print_stats("Estimated cost", f"${cost:.4f} USD")
             
             # Extract the edited text from retry
             edited_text = message.content[0].text
             
             # Clean up the response again
+            spinner = Spinner("Cleaning up retry response...").start() 
             edited_text = cleanup_response(edited_text)
+            spinner.stop("Retry response cleaned")
             
             # Final validation
+            spinner = Spinner("Validating retry result...").start()
             if not validate_edited_text(original_text, edited_text, review_notes):
+                spinner.stop("Validation failed again")
                 warning("AI still produced shortened text. Saving anyway, but please review.")
+            else:
+                spinner.stop("Validation successful")
+        else:
+            spinner.stop("Validation successful")
         
         # Save the edited text
+        spinner = Spinner("Saving edited text...").start()
         output_path = save_edited_text(text_file, edited_text, model, output_format)
+        spinner.stop(f"Saved to {output_path}")
         
         # Print final statistics
         final_word_count = len(edited_text.split())
@@ -320,6 +385,8 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
         
         return edited_text
     except Exception as e:
+        if 'spinner' in locals():
+            spinner.stop()
         error(f"Error processing {text_file}: {e}")
         traceback.print_exc()
         return None
@@ -362,23 +429,33 @@ def sanitize_custom_id(filename):
 def process_batch_item(client, text_file, model, instructions_content, output_format="same"):
     """Process a single item from a batch, with validation and cleanup"""
     # Read the text file
+    spinner = Spinner(f"Reading {text_file}...").start()
     original_text = read_file_content(text_file)
     
     # Get review notes if they exist
     review_notes = get_review_notes(text_file)
     
     if review_notes:
+        spinner.stop(f"Read file with review notes: {text_file}")
         info(f"📝 Review notes found")
+    else:
+        spinner.stop(f"Read file: {text_file}")
     
     # Create prompt
+    spinner = Spinner("Preparing prompt...").start()
     prompt = create_editing_prompt(original_text, review_notes, instructions_content)
+    spinner.stop("Prompt ready")
     
     # Set max_tokens based on model
     max_tokens = get_max_tokens_for_model(model)
+    
+    # Track total tokens and cost
+    total_tokens = 0
+    total_cost = 0
 
     # Send to Claude
     try:
-        info(f"🚀 Sending request to Claude API")
+        spinner = Spinner(f"Sending request to Claude API ({model})...").start()
         start_time = time.time()
         
         message = client.messages.create(
@@ -391,19 +468,36 @@ def process_batch_item(client, text_file, model, instructions_content, output_fo
         )
         
         duration = time.time() - start_time
-        success(f"Request completed in {duration:.1f} seconds")
+        spinner.stop(f"Request completed in {duration:.1f} seconds")
         
         # Extract the edited text
         edited_text = message.content[0].text
         
+        # Track token usage and cost
+        input_tokens = message.usage.input_tokens
+        output_tokens = message.usage.output_tokens
+        total_tokens += (input_tokens + output_tokens)
+        
+        # Calculate cost
+        request_cost = estimate_cost(model, input_tokens, output_tokens)
+        total_cost += request_cost
+        
+        # Display token usage
+        info(f"Tokens: {input_tokens} in, {output_tokens} out (${request_cost:.4f})")
+        
         # Clean up the response to remove any metadata
+        spinner = Spinner("Processing response...").start()
         edited_text = cleanup_response(edited_text)
+        spinner.stop("Response processed")
         
         # Validate the edited text
+        spinner = Spinner("Validating edit...").start()
         if not validate_edited_text(original_text, edited_text, review_notes):
+            spinner.stop("Validation failed - text appears shortened")
             warning(f"Batch item {text_file} produced shortened text - regenerating...")
             
             # Add stronger instructions to prevent shortening
+            spinner = Spinner("Preparing retry...").start()
             retrying_prompt = (
                 "You are a professional editor skilled in enhancing text without losing content or nuance.\n\n"
                 
@@ -428,9 +522,10 @@ def process_batch_item(client, text_file, model, instructions_content, output_fo
                 )
             
             retrying_prompt += "## YOUR CORRECTED EDIT (FULL LENGTH)\n"
+            spinner.stop("Retry prompt ready")
             
             # Try again with stronger instructions
-            info("🔄 Sending request with stronger instructions...")
+            spinner = Spinner("Sending retry request...").start()
             start_time = time.time()
             
             message = client.messages.create(
@@ -443,24 +538,49 @@ def process_batch_item(client, text_file, model, instructions_content, output_fo
             )
             
             duration = time.time() - start_time
-            success(f"Request completed in {duration:.1f} seconds")
+            spinner.stop(f"Retry completed in {duration:.1f} seconds")
+            
+            # Track retry token usage and cost
+            retry_input_tokens = message.usage.input_tokens
+            retry_output_tokens = message.usage.output_tokens
+            total_tokens += (retry_input_tokens + retry_output_tokens)
+            
+            # Calculate retry cost
+            retry_cost = estimate_cost(model, retry_input_tokens, retry_output_tokens)
+            total_cost += retry_cost
+            
+            # Display token usage
+            info(f"Retry tokens: {retry_input_tokens} in, {retry_output_tokens} out (${retry_cost:.4f})")
             
             # Extract the edited text from retry
             edited_text = message.content[0].text
             
             # Clean up the response again
+            spinner = Spinner("Processing retry response...").start()
             edited_text = cleanup_response(edited_text)
+            spinner.stop("Retry processed")
             
             # Final validation
+            spinner = Spinner("Validating retry...").start()
             if not validate_edited_text(original_text, edited_text, review_notes):
+                spinner.stop("Final validation failed")
                 warning(f"Batch item {text_file} still produced shortened text. Saving anyway.")
+            else:
+                spinner.stop("Final validation successful")
+        else:
+            spinner.stop("Validation successful")
         
         # Save the edited text
+        spinner = Spinner("Saving edited text...").start()
         output_path = save_edited_text(text_file, edited_text, model, output_format)
-        success(f"Saved edited text to {output_path}")
+        spinner.stop(f"Saved to {output_path}")
+        
+        success(f"Processed {text_file} - Total cost: ${total_cost:.4f} ({total_tokens} tokens)")
         
         return edited_text
     except Exception as e:
+        if 'spinner' in locals():
+            spinner.stop()
         error(f"Error processing batch item {text_file}: {e}")
         return None
 
@@ -470,26 +590,81 @@ def batch_edit_texts(client, text_files, model, instructions_content, output_for
         warning("No text files found in original-texts directory.")
         return
     
+    # Track batch totals
+    batch_total_tokens = 0
+    batch_total_cost = 0
+    processed_count = 0
+    skipped_count = 0
+    
     # Filter files that need editing
+    spinner = Spinner("Checking files to process...").start()
     files_to_edit = []
     for text_file in text_files:
         if is_already_edited(text_file, model):
-            info(f"Skipping {text_file} - already edited by {model} and no review notes found.")
+            skipped_count += 1
         else:
             files_to_edit.append(text_file)
     
     if not files_to_edit:
-        info("No files need editing.")
+        spinner.stop("No files need editing")
+        info("All files have already been processed.")
         return
+    
+    spinner.stop(f"Found {len(files_to_edit)} files to process ({skipped_count} skipped)")
     
     # Process files individually
     success(f"Processing {len(files_to_edit)} files...")
     
     for i, text_file in enumerate(files_to_edit):
         print_subheader(f"BATCH ITEM {i+1}/{len(files_to_edit)}: {text_file}")
-        process_batch_item(client, text_file, model, instructions_content, output_format)
         
+        # Record token count before processing
+        pre_tokens = get_total_tokens_used(client, model)
+        
+        # Process the item
+        result = process_batch_item(client, text_file, model, instructions_content, output_format)
+        
+        # Get tokens used in this operation
+        post_tokens = get_total_tokens_used(client, model)
+        tokens_this_file = post_tokens - pre_tokens
+        
+        # Estimate cost for this file
+        # Assuming average token cost for simplicity
+        if "opus" in model:
+            avg_token_cost = 0.00004
+        elif "sonnet" in model:
+            avg_token_cost = 0.00001
+        else:  # haiku or others
+            avg_token_cost = 0.0000007
+        
+        cost_this_file = tokens_this_file * avg_token_cost
+        
+        # Update batch totals
+        if result:
+            batch_total_tokens += tokens_this_file
+            batch_total_cost += cost_this_file
+            processed_count += 1
+        
+        # Show progress
+        info(f"Progress: {i+1}/{len(files_to_edit)} files ({processed_count} successful)")
+        info(f"Running cost: ${batch_total_cost:.4f} ({batch_total_tokens} tokens)")
+        
+    # Final summary
+    print_subheader("🔶 BATCH PROCESSING SUMMARY")
+    print_stats("Files processed", processed_count)
+    print_stats("Files skipped", skipped_count)
+    print_stats("Total tokens used", batch_total_tokens)
+    print_stats("Estimated total cost", f"${batch_total_cost:.4f} USD")
+    
     success("Batch processing complete!")
+
+def get_total_tokens_used(client, model):
+    """Placeholder function to track token usage
+    In a real implementation, this could use Anthropic's reporting API"""
+    # This is just a placeholder - Claude API doesn't currently 
+    # have a built-in way to track cumulative token usage
+    # Future implementation could use client.get_usage() if available
+    return 0  # For now we rely on per-request tracking
 
 def validate_edited_text(original_text, edited_text, review_notes=None):
     """Validate that the edited text is not significantly shorter than the original
@@ -591,6 +766,35 @@ def cleanup_response(text):
     
     return cleaned_text
 
+def estimate_cost(model, input_tokens, output_tokens):
+    """Estimate the cost of API usage based on model and tokens"""
+    # Claude pricing as of July 2024 (subject to change)
+    pricing = {
+        "claude-3-opus": {"input": 15.0, "output": 75.0},
+        "claude-3-sonnet": {"input": 3.0, "output": 15.0},
+        "claude-3-haiku": {"input": 0.25, "output": 1.25},
+        "claude-3-5-sonnet": {"input": 3.0, "output": 15.0},
+        "claude-3-5-haiku": {"input": 0.25, "output": 1.25},
+        "claude-3-7-sonnet": {"input": 5.0, "output": 15.0},
+    }
+    
+    # Find the right pricing tier
+    model_pricing = None
+    for model_key, price in pricing.items():
+        if model_key in model:
+            model_pricing = price
+            break
+    
+    # If model not found, use haiku pricing (lowest) as fallback
+    if not model_pricing:
+        model_pricing = pricing["claude-3-haiku"]
+    
+    # Calculate cost (price is per million tokens, so divide by 1,000,000)
+    input_cost = (input_tokens * model_pricing["input"]) / 1000000
+    output_cost = (output_tokens * model_pricing["output"]) / 1000000
+    
+    return input_cost + output_cost
+
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Book Editor Agent using Claude AI")
@@ -610,42 +814,85 @@ def main():
     
     # List models if requested
     if args.list_models:
+        print_header("AVAILABLE CLAUDE MODELS")
         models = get_available_models()
-        info("Available Claude models:")
+        # Display models with their pricing
+        print_subheader("Model | Input Price | Output Price")
+        print_subheader("------|-------------|------------")
         for model, description in models.items():
-            info(f"  {model}: {description}")
+            # Get pricing information
+            if "opus" in model:
+                input_price, output_price = "$15.00", "$75.00"
+            elif "sonnet" in model and "3-7" in model:
+                input_price, output_price = "$5.00", "$15.00"
+            elif "sonnet" in model:
+                input_price, output_price = "$3.00", "$15.00"
+            elif "haiku" in model:
+                input_price, output_price = "$0.25", "$1.25"
+            else:
+                input_price, output_price = "Unknown", "Unknown"
+                
+            info(f"{model} | {input_price}/M | {output_price}/M | {description}")
+        
+        info("\nPrices are per million tokens (M). Subject to change - see Anthropic pricing page for latest.")
         return
     
     # Get API key and create client
+    spinner = Spinner("Connecting to Anthropic API...").start()
     try:
         api_key = get_api_key()
         client = create_anthropic_client(api_key)
-        success("Connected to Anthropic API")
+        spinner.stop("Connected to Anthropic API")
     except ValueError as e:
+        spinner.stop("API key error")
         error(str(e))
         info("Make sure you have set the ANTHROPIC_API_KEY environment variable.")
         return
     except Exception as e:
+        spinner.stop("Connection error")
         error(f"Failed to initialize Anthropic client: {str(e)}")
         return
     
     # Get text files
+    spinner = Spinner("Finding text files...").start()
     text_files = get_text_files()
     
     if not text_files:
+        spinner.stop("No files found")
         warning("No text files (.txt or .docx) found in original-texts directory.")
         return
     
-    info(f"Found {len(text_files)} text files to process")
+    spinner.stop(f"Found {len(text_files)} text files")
     info(f"Output format: {args.output_format}")
     
     # Read instructions for style guidelines
+    spinner = Spinner("Loading style guidelines...").start()
     try:
         instructions_content = read_file_content("INSTRUCTIONS.md")
-        success("Successfully loaded style guidelines from INSTRUCTIONS.md")
+        spinner.stop("Successfully loaded style guidelines")
     except FileNotFoundError:
+        spinner.stop("Instructions file not found")
         warning("INSTRUCTIONS.md not found. Using default style guidelines.")
         instructions_content = "Default style guidelines: Academic yet accessible writing with clear explanations."
+    
+    # Show cost estimate for selected model
+    print_subheader("💰 COST INFORMATION")
+    if "opus" in args.model:
+        info(f"Model: {args.model} (Premium tier - most expensive)")
+        info(f"Input pricing: $15.00 per million tokens")
+        info(f"Output pricing: $75.00 per million tokens")
+    elif "sonnet" in args.model and "3-7" in args.model:
+        info(f"Model: {args.model} (High-performance tier)")
+        info(f"Input pricing: $5.00 per million tokens")
+        info(f"Output pricing: $15.00 per million tokens")
+    elif "sonnet" in args.model:
+        info(f"Model: {args.model} (Standard tier)")
+        info(f"Input pricing: $3.00 per million tokens")
+        info(f"Output pricing: $15.00 per million tokens")
+    elif "haiku" in args.model:
+        info(f"Model: {args.model} (Economy tier - most affordable)")
+        info(f"Input pricing: $0.25 per million tokens")
+        info(f"Output pricing: $1.25 per million tokens")
     
     # Process files
     if args.batch:
