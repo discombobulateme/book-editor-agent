@@ -153,6 +153,32 @@ def get_available_models():
         "zephyr": "Fast but high-quality 7B instruction model"
     }
 
+def get_ollama_installed_models():
+    """Get a list of models that are actually installed in Ollama"""
+    try:
+        response = requests.get("http://localhost:11434/api/tags")
+        if response.status_code == 200:
+            data = response.json()
+            # Extract model names and creation dates
+            models = []
+            for model in data.get("models", []):
+                model_name = model.get("name", "")
+                size = model.get("size", 0) / (1024 * 1024 * 1024)  # Convert to GB
+                models.append({
+                    "name": model_name,
+                    "size": f"{size:.1f} GB"
+                })
+            return models
+        else:
+            error(f"Failed to get installed models: HTTP {response.status_code}")
+            return []
+    except requests.exceptions.ConnectionError:
+        error("Could not connect to Ollama server. Is Ollama running?")
+        return []
+    except Exception as e:
+        error(f"Error fetching installed models: {str(e)}")
+        return []
+
 def call_ollama_api(model_name, prompt, base_url=None, temp_adjustment=0):
     """Call the Ollama API to get a response"""
     if base_url is None:
@@ -278,24 +304,27 @@ def cleanup_response(text):
     
     return cleaned_text
 
-def create_output_path(input_file):
-    """Create an output file path based on the input file path"""
+def create_output_path(input_file, model_name="model"):
+    """Create an output file path based on the input file path and model name"""
     # Extract the base name and extension
-    base_dir = os.path.dirname(input_file)
     file_name = os.path.basename(input_file)
     name, ext = os.path.splitext(file_name)
     
-    # Create edited-texts directory if it doesn't exist
-    output_dir = os.path.join(base_dir, "edited-texts")
+    # Create edited-texts directory at the root level if it doesn't exist
+    output_dir = "edited-texts"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         info(f"📁 Created output directory: {output_dir}")
     
-    # Create a timestamp for uniqueness
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    # Create the output file path with model name included
+    output_file = os.path.join(output_dir, f"{name}-{model_name}{ext}")
     
-    # Create the output file path
-    output_file = os.path.join(output_dir, f"{name}-edited-{timestamp}{ext}")
+    # Check if the file already exists and add a version number if it does
+    version = 1
+    while os.path.exists(output_file):
+        # Increment version number and create a new filename
+        output_file = os.path.join(output_dir, f"{name}-{model_name}-{version}{ext}")
+        version += 1
     
     return output_file
 
@@ -314,7 +343,7 @@ def edit_text(input_file, output_path=None, model_name="mistral", review_notes=N
             
         # Create output path if not provided
         if not output_path:
-            output_path = create_output_path(input_file)
+            output_path = create_output_path(input_file, model_name)
             
         # Handle cleanup on Ctrl+C
         def signal_handler(sig, frame):
@@ -375,9 +404,9 @@ def validate_edited_text(original_text, edited_text, review_notes_exist, model_n
     edited_paragraphs = len([p for p in edited_text.split("\n\n") if p.strip()])
     
     # Print statistics
-    print_stats(f"Original text: {original_words} words, {original_paragraphs} paragraphs")
-    print_stats(f"Edited text: {edited_words} words, {edited_paragraphs} paragraphs")
-    print_stats(f"Word count change: {word_diff_percent:.1f}%")
+    print_stats("Original text", f"{original_words} words, {original_paragraphs} paragraphs")
+    print_stats("Edited text", f"{edited_words} words, {edited_paragraphs} paragraphs")
+    print_stats("Word count change", f"{word_diff_percent:.1f}%")
     
     # Check for summary indicators
     summary_phrases = [
@@ -477,7 +506,31 @@ def main():
     parser.add_argument("--ollama-url", default=None, help="Ollama API base URL (default: http://localhost:11434)")
     parser.add_argument("--review", help="Path to review notes file")
     parser.add_argument("--batch", "-b", action="store_true", help="Process all files in original-texts directory")
+    parser.add_argument("--list-models", "-l", action="store_true", help="List installed Ollama models")
     args = parser.parse_args()
+    
+    # List models if requested
+    if args.list_models:
+        print_header("INSTALLED OLLAMA MODELS")
+        installed_models = get_ollama_installed_models()
+        if not installed_models:
+            warning("No models found or Ollama is not running")
+            info("💡 Tip: Start Ollama with 'ollama serve' and make sure it's running")
+            return
+        
+        # Print table of models
+        print_subheader("Model Name | Size")
+        print_subheader("----------|-----")
+        for model in installed_models:
+            info(f"{model['name']} | {model['size']}")
+        
+        # Print suggestion for recommended models
+        print_subheader("\nRECOMMENDED MODELS")
+        info("If you don't see the models you need, you can pull them with:")
+        info("  ollama pull mistral      # good all-around model")
+        info("  ollama pull llama3.1     # high quality")
+        info("  ollama pull zephyr       # fast and efficient")
+        return
     
     # Read the style instructions
     try:
@@ -532,7 +585,7 @@ def main():
             info(f"⏭️  Skipping {text_file} - already edited by {args.model} and no review notes found.")
             continue
         
-        output_file = create_output_path(text_file)
+        output_file = create_output_path(text_file, args.model)
         result = edit_text(
             input_file=text_file,
             output_path=output_file,

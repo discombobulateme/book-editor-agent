@@ -8,7 +8,14 @@ __pycache__/
 .DS_Store
 *.DS_Store
 
-original-texts/
-edited-texts/
+# Ignore contents but keep directories
+original-texts/*
+edited-texts/*
+review-notes/*
+
+# But keep .gitkeep files to maintain directory structure
+!original-texts/.gitkeep
+!edited-texts/.gitkeep
+!review-notes/.gitkeep
 
 INSTRUCTIONS.md
