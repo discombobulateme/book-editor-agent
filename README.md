@@ -1,16 +1,43 @@
 # Book Editor Agent
 
-An AI-powered text editor that applies style guidelines to text files using either Claude API or local open-source models via Ollama.
+Text editor that applies style guidelines to text files using either Claude API or local open-source models via Ollama.
+
+Terminal feedback lets you follow the process and anticipate costs when using Claude API. Simplified cli flags lets you: control the output format, control chunk size and if you want your API call to be sent as batch when dealing with multiple files. 
+
+## How does it work?
+
+You have 3 folders: 
+- original-texts: where you add the texts you want to be edited
+- review-notes: this is your prompt, what you want your editor to do
+- edited-texts: the output of your LLM with the same name as your original filename + model + version number
+
+When you run your script, it will search for review-notes. If there's a review note, with the same name as an original text, it will edit. If there's already an edited file with that name, it will add a version number at the end of the file's name. 
+
+Your style instructions should be added to a separated file in the root directory called INSTRUCTIONS.md
+
+## Processing Options
+
+Two main options help you handle both multiple files and large documents:
+
+- **--batch**: Processes multiple files in sequence. It will find all files with matching review notes and process them one after another automatically.
+
+- **--chunk-size**: For handling large individual documents. Setting a chunk size (like 5000 words) will split large texts into smaller pieces for better processing, then recombine them.
+
+For multiple large files, use both together:
+```bash
+python book_editor_agent.py --model claude-3-7-sonnet-20250219 --output-format docx --batch --chunk-size 5000
+```
 
 ## Features
 
 - Support for Claude (Anthropic) models and Ollama-based models (Mistral, Llama, DeepSeek)
-- Smart handling to prevent models from summarizing content
-- Paragraph-by-paragraph editing for challenging content
-- Review note handling for specific editing requests
+- Prevent models from summarizing content unless explicit in instructions
+- Smart chunking for large documents to avoid context limits
+- Batch processing for multiple files with review notes
 - Support for both .txt and .docx file formats
 - Format conversion (txt to docx and vice versa)
 - List installed Ollama models for local editing
+- Connection monitoring with real-time status updates
 
 ## Setup
 
@@ -28,7 +55,7 @@ An AI-powered text editor that applies style guidelines to text files using eith
    
    # Update pip and install dependencies
    pip install --upgrade pip
-   pip install -r requirements.txt   # This installs anthropic==0.51.0 (latest)
+   pip install -r requirements.txt 
    ```
 
 3. Configure your environment
@@ -36,20 +63,18 @@ An AI-powered text editor that applies style guidelines to text files using eith
    - For Claude: Add `ANTHROPIC_API_KEY=your_api_key_here`
    - For local models: [Install Ollama](https://ollama.com/download)
    
-4. Download required models
+4. Download your preferred open source model. This will allow you to use free open source models locally
+
    ```bash
-   # For local Ollama models
    ollama pull mistral    # Fast 7B model, good general choice
    ollama pull llama3.1   # High quality but larger
    ollama pull deepseek-r1 # Strong reasoning capabilities
-   
-   # Claude models are available via API once key is configured
    ```
 
 5. Prepare your content
    - Place text files (.txt or .docx) in `original-texts/` directory
-   - Optional: Create style guide as `INSTRUCTIONS.md`
-   - Optional: Create review notes (explained below)
+   - Create style guide as `INSTRUCTIONS.md`
+   - Create review notes in the `review-notes/` directory with the same filename as your text
 
 ## Understanding Review Notes
 
