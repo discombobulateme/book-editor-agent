@@ -8,6 +8,9 @@ An AI-powered text editor that applies style guidelines to text files using eith
 - Smart handling to prevent models from summarizing content
 - Paragraph-by-paragraph editing for challenging content
 - Review note handling for specific editing requests
+- Support for both .txt and .docx file formats
+- Format conversion (txt to docx and vice versa)
+- List installed Ollama models for local editing
 
 ## Setup
 
@@ -44,7 +47,7 @@ An AI-powered text editor that applies style guidelines to text files using eith
    ```
 
 5. Prepare your content
-   - Place text files in `original-texts/` directory
+   - Place text files (.txt or .docx) in `original-texts/` directory
    - Optional: Create style guide as `INSTRUCTIONS.md`
    - Optional: Create review notes (explained below)
 
@@ -77,15 +80,21 @@ python3 book_editor_agent.py
 python3 book_editor_agent.py --list-models
 
 # Use specific model
-python3 book_editor_agent.py --model claude-3-sonnet-20240229
+python3 book_editor_agent.py --model claude-3-sonnet
 
 # Process all files in batch mode
 python3 book_editor_agent.py --batch
+
+# Specify output format (txt, docx, or same as input)
+python3 book_editor_agent.py --output-format docx
 ```
 
 ### Using Ollama (Local Models)
 
 ```bash
+# List local installed Ollama models
+python3 open_editor_agent.py --list-models
+
 # Edit a specific file with default model (mistral)
 python3 open_editor_agent.py path/to/text.txt
 
@@ -103,6 +112,26 @@ Example with review notes:
 ```bash
 # This will edit essay.txt according to the feedback in review.txt
 python3 open_editor_agent.py original-texts/essay.txt --review review.txt --model mistral
+```
+
+## Working with Document Formats
+
+The book editor agent now supports both .txt and .docx file formats:
+
+- **Input formats**: Place either .txt or .docx files in the `original-texts/` directory
+- **Output formats**: Control output format with the `--output-format` flag:
+  - `--output-format txt` - Save as plain text
+  - `--output-format docx` - Save as Word document
+  - `--output-format same` - Keep the same format as the input (default)
+- **Review notes**: Can be in either .txt or .docx format in the `review-notes/` directory
+
+Example converting formats:
+```bash
+# Convert a .txt file to .docx during editing
+python3 book_editor_agent.py original-texts/chapter.txt --output-format docx
+
+# Convert a .docx file to .txt during editing
+python3 book_editor_agent.py original-texts/manuscript.docx --output-format txt
 ```
 
 ## Configuration Options
