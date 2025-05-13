@@ -717,6 +717,7 @@ def get_max_tokens_for_model(model):
 def get_available_models():
     """Return a dictionary of available Claude models with their descriptions"""
     return {
+        "claude-3-7-sonnet-20250219": "Claude 3.7 Sonnet - Latest high performance model",
         "claude-3-5-sonnet-20240620": "Claude 3.5 Sonnet - Latest balanced model",
         "claude-3-5-haiku-20240620": "Claude 3.5 Haiku - Latest affordable model",
         "claude-3-opus-20240229": "Claude 3 Opus - Highest quality, most expensive",
