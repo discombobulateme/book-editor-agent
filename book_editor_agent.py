@@ -7,9 +7,11 @@ import re
 import argparse
 import traceback
 import docx
+import threading
+import signal
 
 # Import our terminal colors utility
-from terminal_colors import Colors, print_header, print_subheader, print_stats, success, warning, error, info, debug, Spinner
+from terminal_colors import Colors, print_header, print_subheader, print_stats, success, warning, error, info, debug, Spinner, StatusUpdatingSpinner, ConnectionMonitoringSpinner
 
 # Load environment variables
 load_dotenv()
@@ -170,7 +172,7 @@ def is_already_edited(filename, model):
     # File has been edited and no review notes exist
     return True
 
-def edit_text_with_claude(client, text_file, model, instructions_content, output_format="same"):
+def edit_text_with_claude(client, text_file, model, instructions_content, output_format="same", chunk_size=0):
     """Edit a text file using Claude"""
     # Check if the file has already been edited by this model and has no review notes
     if is_already_edited(text_file, model):
@@ -179,217 +181,452 @@ def edit_text_with_claude(client, text_file, model, instructions_content, output
     
     print_header(f"PROCESSING: {text_file} with model {model}")
     
-    # Read the text file
-    spinner = Spinner("Reading input file...").start()
-    original_text = read_file_content(text_file)
-    spinner.stop(f"Read input file: {text_file}")
+    # Initialize variables to keep track of resources that need cleanup
+    api_spinner = None
+    connection_monitor = None
+    old_handler = None
     
-    # Get review notes if they exist
-    spinner = Spinner("Checking for review notes...").start()
-    review_notes = get_review_notes(text_file)
-    
-    if review_notes:
-        spinner.stop("Found review notes")
-        print_subheader("📝 REVIEW NOTES FOUND")
-        info(review_notes)
-    else:
-        spinner.stop("No review notes found")
-        info("📋 No review notes found. Proceeding with standard editing.")
-    
-    # Get text statistics for original text
-    spinner = Spinner("Analyzing text...").start()
-    original_word_count = len(original_text.split())
-    original_char_count = len(original_text)
-    original_paragraphs = len([p for p in original_text.split('\n\n') if p.strip()])
-    spinner.stop("Text analysis complete")
-    
-    print_subheader("📊 ORIGINAL TEXT STATISTICS")
-    print_stats("Words", original_word_count)
-    print_stats("Characters", original_char_count)
-    print_stats("Paragraphs", original_paragraphs)
-    
-    # Create prompt
-    spinner = Spinner("Preparing editing prompt...").start()
-    prompt = create_editing_prompt(original_text, review_notes, instructions_content)
-    
-    # Estimate token count and cost
-    input_tokens = len(prompt.split()) * 1.3  # Rough estimate: words * 1.3
-    spinner.stop(f"Prompt prepared (~{int(input_tokens)} estimated tokens)")
-    
-    # Set max_tokens based on model
-    max_tokens = get_max_tokens_for_model(model)
-
-    # Send to Claude
     try:
-        spinner = Spinner(f"Sending request to Claude API ({model})... This may take some time").start()
+        # Read the text file
+        spinner = Spinner("Reading input file...").start()
+        original_text = read_file_content(text_file)
+        spinner.stop(f"Read input file: {text_file}")
         
-        start_time = time.time()
-        message = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=0.85,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-        end_time = time.time()
+        # Get review notes if they exist
+        spinner = Spinner("Checking for review notes...").start()
+        review_notes = get_review_notes(text_file)
         
-        duration = end_time - start_time
-        spinner.stop(f"Request completed in {duration:.1f} seconds")
+        if review_notes:
+            spinner.stop("Found review notes")
+            print_subheader("📝 REVIEW NOTES FOUND")
+            info(review_notes)
+        else:
+            spinner.stop("No review notes found")
+            info("📋 No review notes found. Proceeding with standard editing.")
         
-        # Extract the edited text
-        edited_text = message.content[0].text
+        # Get text statistics for original text
+        spinner = Spinner("Analyzing text...").start()
+        original_word_count = len(original_text.split())
+        original_char_count = len(original_text)
+        original_paragraphs = len([p for p in original_text.split('\n\n') if p.strip()])
+        spinner.stop("Text analysis complete")
         
-        # Calculate tokens and cost
-        input_tokens = message.usage.input_tokens
-        output_tokens = message.usage.output_tokens
-        total_tokens = input_tokens + output_tokens
+        print_subheader("📊 ORIGINAL TEXT STATISTICS")
+        print_stats("Words", original_word_count)
+        print_stats("Characters", original_char_count)
+        print_stats("Paragraphs", original_paragraphs)
         
-        # Estimate cost based on model
-        cost = estimate_cost(model, input_tokens, output_tokens)
+        # Calculate estimated processing time
+        estimated_minutes = estimate_processing_time(original_word_count, model)
         
-        # Display token usage and cost
-        print_subheader("💰 API USAGE")
-        print_stats("Input tokens", input_tokens)
-        print_stats("Output tokens", output_tokens)
-        print_stats("Total tokens", total_tokens)
-        print_stats("Estimated cost", f"${cost:.4f} USD")
-        
-        # Clean up the response to remove any metadata
-        spinner = Spinner("Cleaning up response...").start()
-        edited_text = cleanup_response(edited_text)
-        spinner.stop("Response cleaned")
-        
-        # Get word count stats for edited text
-        spinner = Spinner("Analyzing edited text...").start()
-        edited_word_count = len(edited_text.split())
-        edited_char_count = len(edited_text)
-        edited_paragraphs = len([p for p in edited_text.split('\n\n') if p.strip()])
-        spinner.stop("Analysis complete")
-        
-        print_subheader("📊 EDITED TEXT STATISTICS")
-        print_stats("Words", edited_word_count, original_word_count)
-        print_stats("Characters", edited_char_count, original_char_count)
-        print_stats("Paragraphs", edited_paragraphs, original_paragraphs)
-        
-        # Validate the edited text
-        spinner = Spinner("Validating edited text...").start()
-        validation_result = validate_edited_text(original_text, edited_text, review_notes)
-        
-        if not validation_result:
-            spinner.stop("Validation failed - text appears to be shortened")
-            warning("Attempting to regenerate edited text...")
-            
-            # Add stronger instructions to prevent shortening
-            spinner = Spinner("Preparing retry prompt...").start()
-            retrying_prompt = (
-                "You are a professional editor skilled in enhancing text without losing content or nuance.\n\n"
+        # Check if this is a large document and provide warning and time estimate
+        if original_word_count > 5000:
+            if estimated_minutes > 10:
+                print_subheader("⚠️ LARGE DOCUMENT DETECTED")
+                warning(f"This document has {original_word_count} words.")
+                warning(f"Estimated processing time: {estimated_minutes:.1f} minutes.")
                 
-                "## IMPORTANT CORRECTION NEEDED\n\n"
-                "Your previous edit was too short or appeared to be a summary. Please try again with these requirements:\n"
-                "- Do NOT summarize or condense the text unless specifically asked to in the review notes\n"
-                "- Maintain the FULL length and content of the original text\n"
-                "- Preserve the same number of paragraphs as the original\n"
-                "- Apply the style guidelines while keeping all original details\n\n"
-                
-                "## STYLE GUIDELINES\n"
-                f"{instructions_content}\n\n"
-                
-                "## ORIGINAL TEXT\n"
-                f"{original_text}\n\n"
-            )
-            
-            if review_notes:
-                retrying_prompt += (
-                    "## REVIEW NOTES\n"
-                    f"{review_notes}\n\n"
-                )
-            
-            retrying_prompt += "## YOUR CORRECTED EDIT (FULL LENGTH)\n"
-            
-            # Estimate token count for retry
-            retry_input_tokens = len(retrying_prompt.split()) * 1.3  # Rough estimate
-            spinner.stop(f"Retry prompt prepared (~{int(retry_input_tokens)} estimated tokens)")
-            
-            # Try again with stronger instructions
-            spinner = Spinner("Sending retry request to Claude API... This may take some time").start()
-            
+                if chunk_size == 0:
+                    warning(f"Consider using the --chunk-size option for large documents.")
+                    warning(f"Example: --chunk-size 5000 will process the document in smaller segments.")
+                    
+                    # Ask for confirmation before proceeding
+                    info("Press Enter to continue, or Ctrl+C to cancel.")
+                    try:
+                        input()
+                    except KeyboardInterrupt:
+                        info("Operation cancelled by user.")
+                        return None
+        
+        # If chunking is enabled and document is large enough, process in chunks
+        if chunk_size > 0 and original_word_count > chunk_size:
+            return process_document_in_chunks(client, text_file, original_text, review_notes, 
+                                             instructions_content, model, output_format, chunk_size)
+        
+        # Create prompt
+        spinner = Spinner("Preparing editing prompt...").start()
+        prompt = create_editing_prompt(original_text, review_notes, instructions_content)
+        
+        # Estimate token count and cost
+        input_tokens = len(prompt.split()) * 1.3  # Rough estimate: words * 1.3
+        spinner.stop(f"Prompt prepared (~{int(input_tokens)} estimated tokens)")
+        
+        # Set max_tokens based on model
+        max_tokens = get_max_tokens_for_model(model)
+    
+        # Create a connection monitor for real status updates
+        connection_monitor = AnthropicConnectionMonitor(client, timeout=300)
+        
+        # Use a connection monitoring spinner
+        api_spinner = ConnectionMonitoringSpinner(
+            message=f"Sending request to Claude API ({model})...",
+            check_interval=3,
+            timeout=360
+        ).start_request()
+        
+        # Start monitoring the connection with estimated tokens
+        connection_monitor.start_request(api_spinner, estimated_tokens=input_tokens, model=model)
+        
+        # Set up a timeout handler
+        def timeout_handler(signum, frame):
+            if api_spinner:
+                api_spinner.stop("Request timed out")
+            if connection_monitor:
+                connection_monitor.stop_monitoring()
+            raise TimeoutError("API request timed out")
+        
+        # Set a signal alarm for very long operations (use a safe default)
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        # Use max(5 minutes, 2x estimated time)
+        timeout_seconds = int(max(300, estimated_minutes * 120))
+        signal.alarm(timeout_seconds)
+        
+        try:
             start_time = time.time()
             message = client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
                 temperature=0.85,
                 messages=[
-                    {"role": "user", "content": retrying_prompt}
+                    {"role": "user", "content": prompt}
                 ]
             )
+            
+            # Cancel the alarm and restore the old handler
+            signal.alarm(0)
+            
             end_time = time.time()
-            
             duration = end_time - start_time
-            spinner.stop(f"Retry completed in {duration:.1f} seconds")
+            api_spinner.stop(f"Request completed in {duration:.1f} seconds")
             
-            # Update tokens and cost with retry request
-            retry_input_tokens = message.usage.input_tokens
-            retry_output_tokens = message.usage.output_tokens
-            retry_total_tokens = retry_input_tokens + retry_output_tokens
+            # Extract the edited text
+            edited_text = message.content[0].text
             
-            # Add to previous usage
-            total_tokens += retry_total_tokens
+            # Calculate tokens and cost
+            input_tokens = message.usage.input_tokens
+            output_tokens = message.usage.output_tokens
+            total_tokens = input_tokens + output_tokens
             
-            # Update cost
-            retry_cost = estimate_cost(model, retry_input_tokens, retry_output_tokens)
-            cost += retry_cost
+            # Estimate cost based on model
+            cost = estimate_cost(model, input_tokens, output_tokens)
             
-            # Display updated token usage and cost
-            print_subheader("💰 TOTAL API USAGE (INITIAL + RETRY)")
+            # Display token usage and cost
+            print_subheader("💰 API USAGE")
+            print_stats("Input tokens", input_tokens)
+            print_stats("Output tokens", output_tokens)
             print_stats("Total tokens", total_tokens)
             print_stats("Estimated cost", f"${cost:.4f} USD")
             
-            # Extract the edited text from retry
-            edited_text = message.content[0].text
-            
-            # Clean up the response again
-            spinner = Spinner("Cleaning up retry response...").start() 
+            # Clean up the response to remove any metadata
+            spinner = Spinner("Cleaning up response...").start()
             edited_text = cleanup_response(edited_text)
-            spinner.stop("Retry response cleaned")
+            spinner.stop("Response cleaned")
             
-            # Final validation
-            spinner = Spinner("Validating retry result...").start()
-            if not validate_edited_text(original_text, edited_text, review_notes):
-                spinner.stop("Validation failed again")
-                warning("AI still produced shortened text. Saving anyway, but please review.")
+            # Get word count stats for edited text
+            spinner = Spinner("Analyzing edited text...").start()
+            edited_word_count = len(edited_text.split())
+            edited_char_count = len(edited_text)
+            edited_paragraphs = len([p for p in edited_text.split('\n\n') if p.strip()])
+            spinner.stop("Analysis complete")
+            
+            print_subheader("📊 EDITED TEXT STATISTICS")
+            print_stats("Words", edited_word_count, original_word_count)
+            print_stats("Characters", edited_char_count, original_char_count)
+            print_stats("Paragraphs", edited_paragraphs, original_paragraphs)
+            
+            # Validate the edited text
+            spinner = Spinner("Validating edited text...").start()
+            validation_result = validate_edited_text(original_text, edited_text, review_notes)
+            
+            if not validation_result:
+                spinner.stop("Validation failed - text appears to be shortened")
+                warning("Attempting to regenerate edited text...")
+                
+                # Add stronger instructions to prevent shortening
+                spinner = Spinner("Preparing retry prompt...").start()
+                retrying_prompt = (
+                    "You are a professional editor skilled in enhancing text without losing content or nuance.\n\n"
+                    
+                    "## IMPORTANT CORRECTION NEEDED\n\n"
+                    "Your previous edit was too short or appeared to be a summary. Please try again with these requirements:\n"
+                    "- Do NOT summarize or condense the text unless specifically asked to in the review notes\n"
+                    "- Maintain the FULL length and content of the original text\n"
+                    "- Preserve the same number of paragraphs as the original\n"
+                    "- Apply the style guidelines while keeping all original details\n\n"
+                    
+                    "## STYLE GUIDELINES\n"
+                    f"{instructions_content}\n\n"
+                    
+                    "## ORIGINAL TEXT\n"
+                    f"{original_text}\n\n"
+                )
+                
+                if review_notes:
+                    retrying_prompt += (
+                        "## REVIEW NOTES\n"
+                        f"{review_notes}\n\n"
+                    )
+                
+                retrying_prompt += "## YOUR CORRECTED EDIT (FULL LENGTH)\n"
+                
+                # Estimate token count for retry
+                retry_input_tokens = len(retrying_prompt.split()) * 1.3  # Rough estimate
+                spinner.stop(f"Retry prompt prepared (~{int(retry_input_tokens)} estimated tokens)")
+                
+                # Create a new connection monitor for the retry
+                retry_connection_monitor = AnthropicConnectionMonitor(client, timeout=300)
+                
+                # Try again with real status monitoring
+                retry_api_spinner = ConnectionMonitoringSpinner(
+                    message="Sending retry request to Claude API...",
+                    check_interval=3,
+                    timeout=360
+                ).start_request()
+                
+                # Start monitoring the retry connection
+                retry_connection_monitor.start_request(retry_api_spinner, estimated_tokens=retry_input_tokens, model=model)
+                
+                start_time = time.time()
+                message = client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=0.85,
+                    messages=[
+                        {"role": "user", "content": retrying_prompt}
+                    ]
+                )
+                
+                # Stop the retry connection monitor
+                retry_connection_monitor.stop_monitoring()
+                
+                end_time = time.time()
+                duration = end_time - start_time
+                retry_api_spinner.stop(f"Retry completed in {duration:.1f} seconds")
+                
+                # Update tokens and cost with retry request
+                retry_input_tokens = message.usage.input_tokens
+                retry_output_tokens = message.usage.output_tokens
+                retry_total_tokens = retry_input_tokens + retry_output_tokens
+                
+                # Add to previous usage
+                total_tokens += retry_total_tokens
+                
+                # Update cost
+                retry_cost = estimate_cost(model, retry_input_tokens, retry_output_tokens)
+                cost += retry_cost
+                
+                # Display updated token usage and cost
+                print_subheader("💰 TOTAL API USAGE (INITIAL + RETRY)")
+                print_stats("Total tokens", total_tokens)
+                print_stats("Estimated cost", f"${cost:.4f} USD")
+                
+                # Extract the edited text from retry
+                edited_text = message.content[0].text
+                
+                # Clean up the response again
+                spinner = Spinner("Cleaning up retry response...").start() 
+                edited_text = cleanup_response(edited_text)
+                spinner.stop("Retry response cleaned")
+                
+                # Final validation
+                spinner = Spinner("Validating retry result...").start()
+                if not validate_edited_text(original_text, edited_text, review_notes):
+                    spinner.stop("Validation failed again")
+                    warning("AI still produced shortened text. Saving anyway, but please review.")
+                else:
+                    spinner.stop("Validation successful")
             else:
                 spinner.stop("Validation successful")
-        else:
-            spinner.stop("Validation successful")
-        
-        # Save the edited text
-        spinner = Spinner("Saving edited text...").start()
-        output_path = save_edited_text(text_file, edited_text, model, output_format)
-        spinner.stop(f"Saved to {output_path}")
-        
-        # Print final statistics
-        final_word_count = len(edited_text.split())
-        final_char_count = len(edited_text)
-        final_paragraphs = len([p for p in edited_text.split('\n\n') if p.strip()])
-        
-        final_word_ratio = final_word_count / original_word_count * 100
-        
-        print_subheader("📊 FINAL STATISTICS")
-        info(f"Original: {original_word_count} words, {original_paragraphs} paragraphs")
-        info(f"Edited:   {final_word_count} words, {final_paragraphs} paragraphs")
-        info(f"Ratio:    {final_word_ratio:.1f}% of original length")
-        
-        success(f"Saved edited text to: {output_path}")
-        info(f"{'='*80}\n")
-        
-        return edited_text
+            
+            # Save the edited text
+            spinner = Spinner("Saving edited text...").start()
+            output_path = save_edited_text(text_file, edited_text, model, output_format)
+            spinner.stop(f"Saved to {output_path}")
+            
+            # Print final statistics
+            final_word_count = len(edited_text.split())
+            final_char_count = len(edited_text)
+            final_paragraphs = len([p for p in edited_text.split('\n\n') if p.strip()])
+            
+            final_word_ratio = final_word_count / original_word_count * 100
+            
+            print_subheader("📊 FINAL STATISTICS")
+            info(f"Original: {original_word_count} words, {original_paragraphs} paragraphs")
+            info(f"Edited:   {final_word_count} words, {final_paragraphs} paragraphs")
+            info(f"Ratio:    {final_word_ratio:.1f}% of original length")
+            
+            success(f"Saved edited text to: {output_path}")
+            info(f"{'='*80}\n")
+            
+            return edited_text
+            
+        finally:
+            # Always cancel the alarm when done with the API call
+            signal.alarm(0)
+            if old_handler:
+                signal.signal(signal.SIGALRM, old_handler)
+            
+            # Stop the connection monitor if it exists
+            if connection_monitor:
+                connection_monitor.stop_monitoring()
+    
+    except TimeoutError as e:
+        error(f"API request timed out: {str(e)}")
+        warning("The request to Claude API took too long and was cancelled.")
+        warning("Try using the --chunk-size option for large documents.")
+        return None
     except Exception as e:
-        if 'spinner' in locals():
-            spinner.stop()
         error(f"Error processing {text_file}: {e}")
         traceback.print_exc()
         return None
+    finally:
+        # Final resource cleanup
+        try:
+            if api_spinner:
+                api_spinner.stop()
+        except Exception:
+            pass
+        
+        try:
+            if connection_monitor:
+                connection_monitor.stop_monitoring()
+        except Exception:
+            pass
+        
+        # Reset signal alarm just to be safe
+        signal.alarm(0)
+
+def process_document_in_chunks(client, text_file, original_text, review_notes, instructions_content, model, output_format, chunk_size):
+    """Process a large document by breaking it into chunks, editing each, then recombining"""
+    print_subheader("🧩 CHUNKING LARGE DOCUMENT")
+    
+    # Split the document into chunks
+    spinner = Spinner("Splitting document into chunks...").start()
+    chunks = chunk_document(original_text, max_words=chunk_size)
+    spinner.stop(f"Document split into {len(chunks)} chunks")
+    
+    # Process each chunk
+    edited_chunks = []
+    total_cost = 0
+    total_tokens = 0
+    
+    for i, chunk in enumerate(chunks):
+        chunk_num = i + 1
+        print_subheader(f"PROCESSING CHUNK {chunk_num}/{len(chunks)}")
+        
+        # Create a specific prompt for this chunk
+        spinner = Spinner(f"Preparing prompt for chunk {chunk_num}...").start()
+        
+        # Modify review notes for chunks if needed
+        chunk_reviews = None
+        if review_notes:
+            chunk_reviews = f"CHUNK {chunk_num}/{len(chunks)}: {review_notes}\n\nIMPORTANT: This is chunk {chunk_num} of {len(chunks)}. Focus on editing THIS CHUNK ONLY."
+        
+        chunk_prompt = create_editing_prompt(chunk, chunk_reviews, instructions_content)
+        
+        # Estimate token count
+        estimated_tokens = len(chunk_prompt.split()) * 1.3
+        spinner.stop(f"Chunk prompt prepared (~{int(estimated_tokens)} tokens)")
+        
+        # Set max_tokens based on model
+        max_tokens = get_max_tokens_for_model(model)
+        
+        # Create a connection monitor
+        connection_monitor = AnthropicConnectionMonitor(client, timeout=180)
+        
+        # Process this chunk with real connection monitoring
+        api_spinner = ConnectionMonitoringSpinner(
+            message=f"Processing chunk {chunk_num}/{len(chunks)}...",
+            check_interval=3,
+            timeout=240
+        ).start_request()
+        
+        # Start monitoring the connection
+        connection_monitor.start_request(api_spinner, estimated_tokens=estimated_tokens, model=model)
+        
+        try:
+            # Call Claude API
+            start_time = time.time()
+            message = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=0.85,
+                messages=[
+                    {"role": "user", "content": chunk_prompt}
+                ]
+            )
+            processing_time = time.time() - start_time
+            
+            # Stop the connection monitor
+            connection_monitor.stop_monitoring()
+            
+            # Extract the edited chunk
+            edited_chunk = message.content[0].text
+            
+            # Track token usage and cost
+            input_tokens = message.usage.input_tokens
+            output_tokens = message.usage.output_tokens
+            chunk_tokens = input_tokens + output_tokens
+            total_tokens += chunk_tokens
+            
+            # Calculate cost
+            chunk_cost = estimate_cost(model, input_tokens, output_tokens)
+            total_cost += chunk_cost
+            
+            # Clean up the response
+            edited_chunk = cleanup_response(edited_chunk)
+            
+            # Add to our list of edited chunks
+            edited_chunks.append(edited_chunk)
+            
+            api_spinner.stop(f"Chunk {chunk_num}/{len(chunks)} complete in {processing_time:.1f}s (${chunk_cost:.4f})")
+            
+            # Display progress
+            progress_pct = (chunk_num / len(chunks)) * 100
+            info(f"Progress: {progress_pct:.1f}% complete")
+            info(f"Running cost: ${total_cost:.4f} ({total_tokens} tokens)")
+            
+        except Exception as e:
+            connection_monitor.stop_monitoring()
+            api_spinner.stop()
+            error(f"Error processing chunk {chunk_num}: {e}")
+            # Try to salvage what we have so far
+            if edited_chunk := locals().get('edited_chunk'):
+                edited_chunks.append(edited_chunk)
+                warning(f"Saving partial result for chunk {chunk_num}")
+            # Continue with other chunks
+    
+    # Check if we have any processed chunks
+    if not edited_chunks:
+        error("Failed to process any chunks successfully")
+        return None
+    
+    # Combine the edited chunks
+    spinner = Spinner("Combining edited chunks...").start()
+    combined_text = "\n\n".join(edited_chunks)
+    spinner.stop("All chunks combined")
+    
+    # Display combined statistics
+    word_count = len(combined_text.split())
+    original_word_count = len(original_text.split())
+    
+    print_subheader("📊 CHUNKED PROCESSING RESULTS")
+    print_stats("Original words", original_word_count)
+    print_stats("Edited words", word_count)
+    print_stats("Word ratio", f"{(word_count/original_word_count*100):.1f}%")
+    print_stats("Total chunks", len(chunks))
+    print_stats("Processed chunks", len(edited_chunks))
+    print_stats("Total tokens", total_tokens)
+    print_stats("Total cost", f"${total_cost:.4f}")
+    
+    # Save the result
+    spinner = Spinner("Saving combined result...").start()
+    output_path = save_edited_text(text_file, combined_text, f"{model}-chunked", output_format)
+    spinner.stop(f"Saved to {output_path}")
+    
+    success(f"Chunked processing complete! Saved to: {output_path}")
+    
+    return combined_text
 
 def get_max_tokens_for_model(model):
     """Get appropriate max_tokens value based on model"""
@@ -584,7 +821,7 @@ def process_batch_item(client, text_file, model, instructions_content, output_fo
         error(f"Error processing batch item {text_file}: {e}")
         return None
 
-def batch_edit_texts(client, text_files, model, instructions_content, output_format="same"):
+def batch_edit_texts(client, text_files, model, instructions_content, output_format="same", chunk_size=0):
     """Process multiple text files in a batch request"""
     if not text_files:
         warning("No text files found in original-texts directory.")
@@ -612,6 +849,42 @@ def batch_edit_texts(client, text_files, model, instructions_content, output_for
     
     spinner.stop(f"Found {len(files_to_edit)} files to process ({skipped_count} skipped)")
     
+    # Display large document warnings if applicable
+    large_docs = []
+    for text_file in files_to_edit:
+        # Check file size
+        spinner = Spinner(f"Analyzing {os.path.basename(text_file)}...").start()
+        try:
+            content = read_file_content(text_file)
+            word_count = len(content.split())
+            
+            if word_count > 5000:
+                large_docs.append((text_file, word_count))
+            
+            spinner.stop()
+        except Exception as e:
+            spinner.stop(f"Error reading {text_file}")
+            error(f"Could not analyze {text_file}: {str(e)}")
+    
+    # Warn about large documents
+    if large_docs:
+        print_subheader("⚠️ LARGE DOCUMENTS DETECTED")
+        for doc, words in large_docs:
+            est_time = estimate_processing_time(words, model)
+            warning(f"{os.path.basename(doc)}: {words} words (~{est_time:.1f} min)")
+        
+        if chunk_size == 0:
+            warning("Large documents detected. Consider using --chunk-size for better processing.")
+            warning("Example: --chunk-size 5000 will process large documents in smaller segments.")
+            
+            # Ask for confirmation
+            info("Press Enter to continue with batch processing, or Ctrl+C to cancel.")
+            try:
+                input()
+            except KeyboardInterrupt:
+                info("Batch operation cancelled by user.")
+                return
+    
     # Process files individually
     success(f"Processing {len(files_to_edit)} files...")
     
@@ -621,8 +894,14 @@ def batch_edit_texts(client, text_files, model, instructions_content, output_for
         # Record token count before processing
         pre_tokens = get_total_tokens_used(client, model)
         
-        # Process the item
-        result = process_batch_item(client, text_file, model, instructions_content, output_format)
+        # Process the item, using chunking if enabled
+        spinner = Spinner(f"Processing {os.path.basename(text_file)}...").start()
+        start_time = time.time()
+        
+        result = edit_text_with_claude(client, text_file, model, instructions_content, output_format, chunk_size)
+        
+        processing_time = time.time() - start_time
+        spinner.stop(f"Processed in {processing_time:.1f} seconds")
         
         # Get tokens used in this operation
         post_tokens = get_total_tokens_used(client, model)
@@ -646,7 +925,8 @@ def batch_edit_texts(client, text_files, model, instructions_content, output_for
             processed_count += 1
         
         # Show progress
-        info(f"Progress: {i+1}/{len(files_to_edit)} files ({processed_count} successful)")
+        progress_pct = ((i + 1) / len(files_to_edit)) * 100
+        info(f"Batch progress: {progress_pct:.1f}% ({i+1}/{len(files_to_edit)} files)")
         info(f"Running cost: ${batch_total_cost:.4f} ({batch_total_tokens} tokens)")
         
     # Final summary
@@ -795,6 +1075,208 @@ def estimate_cost(model, input_tokens, output_tokens):
     
     return input_cost + output_cost
 
+def chunk_document(text, max_words=5000, preserve_paragraphs=True):
+    """
+    Split a large document into manageable chunks.
+    
+    Args:
+        text (str): The text to split into chunks
+        max_words (int): Maximum number of words per chunk
+        preserve_paragraphs (bool): Whether to preserve paragraph boundaries
+        
+    Returns:
+        list: List of text chunks
+    """
+    # If the text is small enough, return it as a single chunk
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+    
+    chunks = []
+    
+    if preserve_paragraphs:
+        # Split by paragraphs (double newlines)
+        paragraphs = [p for p in text.split("\n\n") if p.strip()]
+        
+        current_chunk = []
+        current_word_count = 0
+        
+        for paragraph in paragraphs:
+            paragraph_words = len(paragraph.split())
+            
+            # If adding this paragraph would exceed the limit, start a new chunk
+            if current_word_count + paragraph_words > max_words and current_chunk:
+                # Join the current chunk and add it to the list
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = [paragraph]
+                current_word_count = paragraph_words
+            else:
+                # Add this paragraph to the current chunk
+                current_chunk.append(paragraph)
+                current_word_count += paragraph_words
+        
+        # Add the last chunk if it exists
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+    else:
+        # Simple chunking by word count
+        for i in range(0, len(words), max_words):
+            chunk = " ".join(words[i:i+max_words])
+            chunks.append(chunk)
+    
+    return chunks
+
+def estimate_processing_time(word_count, model):
+    """
+    Estimate how long processing will take based on word count and model.
+    
+    Args:
+        word_count (int): Number of words in the document
+        model (str): Name of the model
+    
+    Returns:
+        float: Estimated processing time in minutes
+    """
+    # Base processing rates (words per second) for different models
+    # These are rough estimates and may need adjustment
+    rates = {
+        "opus": 500,      # Claude 3 Opus - most thorough, slowest
+        "sonnet": 800,    # Claude 3 Sonnet - balanced
+        "haiku": 1200,    # Claude 3 Haiku - fastest
+    }
+    
+    # Default to sonnet rate if model not recognized
+    rate = rates.get("sonnet", 800)
+    
+    # Determine which rate to use based on model name
+    for model_type, processing_rate in rates.items():
+        if model_type in model.lower():
+            rate = processing_rate
+            break
+    
+    # Calculate estimated time in minutes
+    estimated_seconds = word_count / rate
+    return estimated_seconds / 60
+
+class AnthropicConnectionMonitor:
+    """Monitors the connection status to Anthropic API and provides heartbeat checks"""
+
+    def __init__(self, client, timeout=120):
+        """
+        Initialize the connection monitor
+        
+        Args:
+            client: Anthropic client instance
+            timeout: Maximum seconds to wait before considering a connection timed out
+        """
+        self.client = client
+        self.timeout = timeout
+        self.last_heartbeat = None
+        self.heartbeat_thread = None
+        self.stop_heartbeat = threading.Event()
+        self.connection_status = "Initializing"
+        self.lock = threading.Lock()
+        self.request_in_progress = False
+        self.request_start_time = None
+        self.expected_duration = None
+        self.estimated_tokens = 0
+
+    def start_request(self, spinner, estimated_tokens=0, model=""):
+        """Start monitoring a request"""
+        self.request_in_progress = True
+        self.request_start_time = time.time()
+        self.last_heartbeat = time.time()
+        
+        # Estimate expected duration based on token count and model
+        self.estimated_tokens = estimated_tokens
+        words_per_second = 600  # Default processing rate
+        
+        # Adjust based on model
+        if "opus" in model.lower():
+            words_per_second = 500
+        elif "sonnet" in model.lower():
+            words_per_second = 800
+        elif "haiku" in model.lower():
+            words_per_second = 1200
+            
+        # Add base overhead (API setup, etc.)
+        self.expected_duration = (estimated_tokens / 1.3) / words_per_second + 5
+        
+        # Set connection status
+        self.connection_status = "Request started"
+        
+        # Update the spinner with initial estimates
+        if spinner:
+            spinner.connection_object = self
+            spinner.update_activity()
+        
+        # Start the heartbeat thread to periodically update status
+        self.stop_heartbeat.clear()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, args=(spinner,))
+        self.heartbeat_thread.daemon = True
+        self.heartbeat_thread.start()
+        
+        return self
+
+    def _heartbeat_loop(self, spinner):
+        """Background thread that updates connection status"""
+        while not self.stop_heartbeat.is_set():
+            if self.request_in_progress:
+                # Calculate elapsed time
+                elapsed_time = time.time() - self.request_start_time
+                
+                # Update status based on elapsed time vs expected duration
+                with self.lock:
+                    if elapsed_time > self.timeout:
+                        self.connection_status = f"Connection may be stalled (timeout exceeded)"
+                    elif elapsed_time > self.expected_duration * 1.5:
+                        self.connection_status = f"Taking longer than expected ({elapsed_time:.0f}s / ~{self.expected_duration:.0f}s)"
+                    elif elapsed_time > self.expected_duration:
+                        self.connection_status = f"Almost complete ({int(elapsed_time/self.expected_duration*90)}%)"
+                    else:
+                        progress = min(95, int(elapsed_time/self.expected_duration*100))
+                        self.connection_status = f"Processing (~{progress}% complete)"
+                
+                # Update spinner if provided
+                if spinner:
+                    spinner.update_activity()
+                    
+                # Set last heartbeat time
+                self.last_heartbeat = time.time()
+                
+            # Sleep for a while before updating again
+            time.sleep(2)
+
+    def update_activity(self):
+        """Update the last activity timestamp"""
+        self.last_heartbeat = time.time()
+        
+    def check_status(self):
+        """Get the current connection status"""
+        with self.lock:
+            if not self.request_in_progress:
+                return "Idle"
+            
+            elapsed_time = time.time() - self.request_start_time
+            time_since_heartbeat = time.time() - self.last_heartbeat
+            
+            # Check for long time since last heartbeat
+            if time_since_heartbeat > 30:
+                return f"Connection may be lost (no heartbeat for {int(time_since_heartbeat)}s)"
+                
+            # Return the current connection status
+            return self.connection_status
+    
+    def stop_monitoring(self):
+        """Stop the heartbeat thread and cleanup"""
+        self.request_in_progress = False
+        self.stop_heartbeat.set()
+        
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join(timeout=1.0)
+            
+        return self
+
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Book Editor Agent using Claude AI")
@@ -809,6 +1291,8 @@ def main():
                         choices=["txt", "docx", "same"],
                         default="same",
                         help="Output format for edited files (txt, docx, or same as input)")
+    parser.add_argument("--chunk-size", type=int, default=0,
+                        help="Split large documents into chunks of this many words (0 disables chunking)")
     
     args = parser.parse_args()
     
@@ -898,11 +1382,11 @@ def main():
     if args.batch:
         # Process files in batch
         print_header(f"BATCH PROCESSING {len(text_files)} FILES WITH {args.model}")
-        batch_edit_texts(client, text_files, args.model, instructions_content, args.output_format)
+        batch_edit_texts(client, text_files, args.model, instructions_content, args.output_format, args.chunk_size)
     else:
         # Process files individually
         for text_file in text_files:
-            edit_text_with_claude(client, text_file, args.model, instructions_content, args.output_format)
+            edit_text_with_claude(client, text_file, args.model, instructions_content, args.output_format, args.chunk_size)
             
     success("Book editing process complete!")
 
